@@ -1944,6 +1944,7 @@ class MoRIIOConnectorWorker:
         self._region_session_index: dict[str, list[int]] | None = None
         self.built_session = False
         self.built_write_session: defaultdict[str, list] = defaultdict(list)
+        self._rebuild_dead_sessions = True
         backend = get_attn_backend(
             self.model_config.get_head_size(),
             self.model_config.dtype,
@@ -2030,6 +2031,22 @@ class MoRIIOConnectorWorker:
         self._writer.schedule_write(task)
 
     def _get_built_session(self, remote_engine_id):
+        cached = self.built_write_session.get(remote_engine_id)
+        rebuilding = (
+            cached is not None
+            and self._rebuild_dead_sessions
+            and not all(session.alive() for session in cached)
+        )
+        if rebuilding:
+            # An RDMA QP that completed a WR with an error stays in the error
+            # state, so a session on it fails every later transfer. MoRI builds
+            # new QPs for new sessions in place of failed ones.
+            logger.warning(
+                "MoRIIO: a session to %s lost its QP; rebuilding its %d sessions",
+                remote_engine_id,
+                len(cached),
+            )
+            del self.built_write_session[remote_engine_id]
         if remote_engine_id not in self.built_write_session:
             remote_layer_map = self.layer_name_to_remote_kv_cache_metadata[
                 remote_engine_id
@@ -2073,6 +2090,17 @@ class MoRIIOConnectorWorker:
                         )
                     cur_remote_engine_sessions.append(session)
             self.built_write_session[remote_engine_id] = cur_remote_engine_sessions
+            if rebuilding and not all(
+                session.alive() for session in cur_remote_engine_sessions
+            ):
+                logger.error(
+                    "MoRIIO: MoRI put the rebuilt sessions to %s on the failed "
+                    "QP again, so transfers to it keep failing; not rebuilding "
+                    "sessions again. This needs a MoRI that builds new QPs in "
+                    "place of failed ones.",
+                    remote_engine_id,
+                )
+                self._rebuild_dead_sessions = False
         return self.built_write_session[remote_engine_id], self.remote_moriio_metadata[
             remote_engine_id
         ]

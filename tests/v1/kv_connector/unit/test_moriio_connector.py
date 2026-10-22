@@ -3,6 +3,7 @@
 import importlib.util
 import socket
 import uuid
+from collections import defaultdict
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -688,6 +689,76 @@ def test_register_kv_caches(mock_parallel_groups):
             ).engine_key
             == expected_engine_key
         )
+
+
+class _FakeSession:
+    def __init__(self, qp_failed: bool = False):
+        self.qp_failed = qp_failed
+
+    def alive(self):
+        return not self.qp_failed
+
+
+def _session_worker(build_session):
+    """A worker with an attention layer and a two-region KDA layer to "peer"."""
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker.moriio_wrapper = SimpleNamespace(
+        get_unpack_memory_metadata=lambda packed: packed,
+        build_session=build_session,
+        shutdown=lambda: None,
+    )
+    worker.built_write_session = defaultdict(list)
+    worker._rebuild_dead_sessions = True
+    worker.layer_name_to_local_kv_cache_metadata = {
+        "attn.0": ["local-0"],
+        "kda.1": ["local-1-conv", "local-1-ssm"],
+    }
+    worker.layer_name_to_remote_kv_cache_metadata = {
+        "peer": {"attn.0": ["remote-0"], "kda.1": ["remote-1-conv", "remote-1-ssm"]}
+    }
+    worker.remote_moriio_metadata = {"peer": "peer-meta"}
+    return worker
+
+
+def test_get_built_session_rebuilds_after_qp_failure():
+    """A cached session whose QP failed is dropped, and every session to that
+    peer is built again, instead of failing each later transfer."""
+    built: list[_FakeSession] = []
+
+    def build_session(local_memory_metadata, remote_memory_metadata):
+        built.append(_FakeSession())
+        return built[-1]
+
+    worker = _session_worker(build_session)
+    sessions, meta = worker._get_built_session("peer")
+    assert len(sessions) == 3 and meta == "peer-meta"
+    assert worker._get_built_session("peer")[0] is sessions
+    assert len(built) == 3
+
+    sessions[2].qp_failed = True
+    rebuilt, _ = worker._get_built_session("peer")
+    assert rebuilt is not sessions
+    assert len(rebuilt) == 3 and all(session.alive() for session in rebuilt)
+    assert len(built) == 6
+
+
+def test_get_built_session_rebuilds_once_onto_the_failed_qp():
+    """A MoRI that puts new sessions on the failed QP again makes rebuilding
+    pointless, so it is tried once rather than on every transfer."""
+    qp_failed = False
+    built: list[_FakeSession] = []
+
+    def build_session(local_memory_metadata, remote_memory_metadata):
+        built.append(_FakeSession(qp_failed))
+        return built[-1]
+
+    worker = _session_worker(build_session)
+    sessions, _ = worker._get_built_session("peer")
+    qp_failed = True
+    sessions[0].qp_failed = True
+    worker._get_built_session("peer")
+    worker._get_built_session("peer")
+    assert len(built) == 6
 
 
 @pytest.mark.skipif(
