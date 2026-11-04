@@ -359,6 +359,18 @@ def test_runtime_config_rejects_invalid_embedded_dram_options(options, error):
         )
 
 
+def test_embedded_dram_watermarks_default_only_when_neither_is_set():
+    unset = SimpleNamespace(dram=SimpleNamespace())
+    embedded._configure_dram(unset, {"capacity_bytes": 1024})
+    assert (unset.dram.high_watermark, unset.dram.low_watermark) == (0.99, 0.97)
+
+    # Setting one keeps MORI's default for the other.
+    one = SimpleNamespace(dram=SimpleNamespace())
+    embedded._configure_dram(one, {"capacity_bytes": 1024, "dram_high_watermark": 0.95})
+    assert one.dram.high_watermark == 0.95
+    assert not hasattr(one.dram, "low_watermark")
+
+
 def test_mori_client_is_created_only_for_worker(monkeypatch, socket_dir):
     """Scheduler lookup must not allocate a second, unused DRAM store."""
     monkeypatch.setitem(sys.modules, "mori.cpp", None)
