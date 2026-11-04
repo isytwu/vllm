@@ -131,7 +131,7 @@ Set these options in `kv_connector_extra_config`:
 | `kv_event_max_objects` | `65536` | Maximum objects tracked for KV events. When full, new stored-object notifications are suppressed until tracked objects leave the pool. Storage and lookup continue normally. |
 | `enable_lookup` | `true` | Restore from the pool. With `false` the connector only stores. |
 | `save_decode_cache` | `false` | Also store blocks produced by decoding. |
-| `enable_partial_hash_hits` | `false` | Allow hits that end inside a block, at core's prefix-match unit (`cache_config.prefix_match_unit`). |
+| `enable_partial_hash_hits` | `false`; `true` for Mamba "align" hybrid models whose prefix-match unit is finer than the scheduler block | Allow hits that end inside a block, at core's prefix-match unit (`cache_config.prefix_match_unit`). A hybrid model's state checkpoints sit on prompt-tail hash boundaries, so block-granular lookups almost never hit it. |
 | `num_workers`, `timeout_ms` | `4`, `30000` | Transfer threads per worker, and the transfer timeout. A synchronous wait that times out fails the step rather than reusing its blocks. |
 | `key_namespace` | derived | Overrides the namespace derived from the model, revision, KV layout, cache groups, parallel topology and draft model. The pool can then hold KV from a different layout, so attention backends that require KV written by their own cache layout fall back as with other connectors. |
 
