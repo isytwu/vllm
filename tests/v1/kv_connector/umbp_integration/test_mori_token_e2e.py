@@ -173,3 +173,53 @@ def test_restore_under_pool_eviction(umbp_llm):
     before = _external_tokens(umbp_llm)
     umbp_llm.generate(prompts[0], PARAMS, use_tqdm=False)
     assert _external_tokens(umbp_llm) == before
+
+
+HYBRID_MODEL = "ibm-granite/granite-4.0-h-350m"
+HYBRID_REVISION = "3b17b717b8f2f5d305b0a92c1491e239aeda19c8"
+
+
+@pytest.fixture
+def umbp_hybrid_llm(vllm_runner, socket_dir):
+    with vllm_runner(
+        HYBRID_MODEL,
+        revision=HYBRID_REVISION,
+        enforce_eager=True,
+        max_model_len=2048,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=True,
+        prefix_match_unit=16,
+        disable_log_stats=False,
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="UMBPStoreConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "mode": "embedded",
+                "capacity_bytes": 1 << 30,
+                "lookup_dir": socket_dir,
+                "enable_partial_hash_hits": True,
+            },
+        ),
+    ) as runner:
+        yield runner.llm
+
+
+def test_hybrid_restores_a_boundary_inside_an_attention_block(umbp_hybrid_llm):
+    """A Mamba checkpoint inside an attention block restores like a GPU hit.
+
+    Mamba hybrids have no batch-invariant kernels, so the reference is a local
+    prefix hit rather than a cold run.
+    """
+    llm = umbp_hybrid_llm
+    block_size = llm.llm_engine.vllm_config.cache_config.block_size
+    prompt = _prompt(0, 2 * block_size + 40)
+    llm.generate(prompt, PARAMS, use_tqdm=False)
+    local_hit = llm.generate(prompt, PARAMS, use_tqdm=False)
+    assert local_hit[0].num_cached_tokens == 2 * block_size + 32
+    _reset_gpu_prefix_cache(llm)
+
+    before = _external_tokens(llm)
+    restored = llm.generate(prompt, PARAMS, use_tqdm=False)
+
+    assert _external_tokens(llm) - before == 2 * block_size + 32
+    _assert_same_outputs(local_hit, restored)
