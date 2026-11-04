@@ -251,11 +251,17 @@ class UMBPStoreConnectorScheduler:
         # A kv_consumer only restores from the pool, as with other store
         # connectors; it never offloads its own KV.
         self.store_enabled = getattr(transfer_config, "kv_role", None) != "kv_consumer"
-        self.enable_partial_hash_hits = bool(
-            extra.get("enable_partial_hash_hits", False)
-        )
         # Request.block_hashes are computed at this size; keys index into them.
         self.hash_block_size = resolved_hash_block_size
+        # Mamba "align" checkpoints sit on prompt-tail hash boundaries, which
+        # block-granular lookups almost never reach.
+        self.enable_partial_hash_hits = bool(
+            extra.get(
+                "enable_partial_hash_hits",
+                bool(self._boundary_handoff_groups)
+                and self.hash_block_size < self.block_size,
+            )
+        )
         lookup_groups = [
             kv_cache_config.kv_cache_groups[group_id]
             for group_id in kv_cache_config.prefix_cacheable_group_ids
