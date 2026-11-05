@@ -457,7 +457,7 @@ class UMBPStoreConnectorScheduler:
             if self.lookup_async:
                 pending = _PendingLookup(
                     context,
-                    self._lookup_executor.submit(self.runtime.lookup, context.keys),
+                    self._lookup_executor.submit(self._lookup_all_ranks, context.keys),
                 )
                 if not self._wait_for_lookup(pending.future):
                     self._pending_lookups[request.request_id] = pending
@@ -468,7 +468,7 @@ class UMBPStoreConnectorScheduler:
             hits = list(
                 pending.future.result()
                 if pending is not None
-                else self.runtime.lookup(context.keys)
+                else self._lookup_all_ranks(context.keys)
             )
         except Exception as exc:
             logger.debug("UMBP lookup failed request=%s: %s", request.request_id, exc)
@@ -626,6 +626,40 @@ class UMBPStoreConnectorScheduler:
         return _LookupContext(
             request, local_tokens, request.num_tokens, hashes, objects, keys
         )
+
+    def _lookup_all_ranks(self, keys: Sequence[str]) -> list[bool]:
+        """Look up ``rank_count`` consecutive keys per object, first rank first.
+
+        Callers only use whether every rank holds an object. Ranks store an
+        object together, and a hash-granular lookup probes far more positions
+        than hold anything, so the first rank is asked about every object and
+        the other ranks only about the objects it holds; a key that is not
+        asked about reads as missing.
+        """
+        assert self.runtime is not None
+        ranks = self.topology.rank_count
+        if ranks == 1 or len(keys) % ranks:
+            return list(self.runtime.lookup(keys))
+        first = list(self.runtime.lookup(keys[::ranks]))
+        if len(first) * ranks != len(keys):
+            raise ValueError("lookup returned an invalid result length")
+        held = [index for index, hit in enumerate(first) if hit]
+        hits = [False] * len(keys)
+        if not held:
+            return hits
+        others = [
+            keys[index * ranks + rank] for index in held for rank in range(1, ranks)
+        ]
+        rest = list(self.runtime.lookup(others))
+        if len(rest) != len(others):
+            raise ValueError("lookup returned an invalid result length")
+        for position, index in enumerate(held):
+            start = index * ranks
+            hits[start] = True
+            hits[start + 1 : start + ranks] = rest[
+                position * (ranks - 1) : (position + 1) * (ranks - 1)
+            ]
+        return hits
 
     def _coordinate_external_hits(
         self,
@@ -1266,7 +1300,7 @@ class UMBPStoreConnectorScheduler:
         if not keys:
             return {}
         try:
-            hits = list(self.runtime.lookup(keys))
+            hits = self._lookup_all_ranks(keys)
         except Exception as exc:
             logger.debug("UMBP store residency check failed: %s", exc)
             return {}
@@ -1596,7 +1630,7 @@ class UMBPStoreConnectorScheduler:
         ]
         self._event_lookup = _EventLookup(
             tuple(candidates),
-            self._lookup_executor.submit(self.runtime.lookup, keys),
+            self._lookup_executor.submit(self._lookup_all_ranks, keys),
         )
 
     def take_events(self) -> list[KVCacheEvent]:
