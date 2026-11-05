@@ -658,6 +658,76 @@ def test_scheduler_lookup_failure_recomputes_and_allows_retry(failure):
         scheduler.close()
 
 
+def test_lookup_asks_other_ranks_only_about_objects_the_first_rank_holds():
+    codec = BlockIdentityCodec(UMBPNamespace("two-phase"))
+    topology = RankTopology(tp_size=2)
+    handle = _SchedulerHandle({})
+    scheduler = UMBPStoreConnectorScheduler(
+        _vllm_config({"mode": "embedded"}, tensor_parallel_size=2, world_size=2),
+        _kv_cache_config(),
+        handle,
+        codec,
+        topology,
+    )
+    keys = [
+        key
+        for block_hash in (b"a", b"b", b"c")
+        for key in codec.keys_for_topology(block_hash, topology, (0,))
+    ]
+    a0, a1, b0, b1, c0, c1 = keys
+    try:
+        # a is on both ranks, b only on the first and c only on the second.
+        handle.hits = {a0: True, a1: True, b0: True, c1: True}
+        hits = scheduler._lookup_all_ranks(keys)
+
+        assert handle.queries == [[a0, b0, c0], [a1, b1]]
+        assert [all(hits[i : i + 2]) for i in range(0, 6, 2)] == [True, False, False]
+
+        handle.queries.clear()
+        handle.hits = {}
+        assert scheduler._lookup_all_ranks(keys) == [False] * 6
+        assert handle.queries == [[a0, b0, c0]]
+    finally:
+        scheduler.close()
+
+
+def test_two_phase_lookup_matches_one_query_for_every_key():
+    codec = BlockIdentityCodec(UMBPNamespace("two-phase-match"))
+    topology = RankTopology(tp_size=2)
+    block_hashes = [bytes([index]) for index in range(8)]
+    stored = {
+        key
+        for block_hash in block_hashes[:5]
+        for key in codec.keys_for_topology(block_hash, topology, (0,))
+    }
+    # Only the first rank holds the sixth object, which is therefore a miss.
+    stored.add(codec.keys_for_topology(block_hashes[5], topology, (0,))[0])
+    results = []
+    for two_phase in (False, True):
+        handle = _SchedulerHandle(dict.fromkeys(stored, True))
+        scheduler = UMBPStoreConnectorScheduler(
+            _vllm_config(
+                {"mode": "embedded", "load_async": False},
+                tensor_parallel_size=2,
+                world_size=2,
+            ),
+            _kv_cache_config(),
+            handle,
+            codec,
+            topology,
+        )
+        if not two_phase:
+            scheduler._lookup_all_ranks = lambda keys, h=handle: list(h.lookup(keys))
+        request = make_request("req", num_tokens=97, block_hashes=block_hashes)
+        try:
+            results.append(scheduler.get_num_new_matched_tokens(request, 0))
+        finally:
+            scheduler.close()
+
+    assert results == [(80, False), (80, False)]
+    assert all(":tp0:" in key for key in handle.queries[0])
+
+
 @pytest.mark.parametrize(("use_eagle", "expected"), [(False, 32), (True, 16)])
 def test_scheduler_single_group_lookup_drops_last_block_for_eagle(use_eagle, expected):
     vllm_config = _vllm_config({"mode": "embedded", "load_async": False})
