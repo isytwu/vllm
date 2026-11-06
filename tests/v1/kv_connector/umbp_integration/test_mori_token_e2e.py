@@ -181,7 +181,9 @@ HYBRID_REVISION = "3b17b717b8f2f5d305b0a92c1491e239aeda19c8"
 
 
 @pytest.fixture
-def umbp_hybrid_llm(vllm_runner, socket_dir):
+def umbp_hybrid_llm(vllm_runner, socket_dir, request):
+    options = dict(getattr(request, "param", {}))
+    prefix_match_unit = options.pop("prefix_match_unit", None)
     with vllm_runner(
         HYBRID_MODEL,
         revision=HYBRID_REVISION,
@@ -189,6 +191,7 @@ def umbp_hybrid_llm(vllm_runner, socket_dir):
         max_model_len=2048,
         enable_chunked_prefill=True,
         enable_prefix_caching=True,
+        prefix_match_unit=prefix_match_unit,
         disable_log_stats=False,
         kv_transfer_config=KVTransferConfig(
             kv_connector="UMBPStoreConnector",
@@ -197,6 +200,7 @@ def umbp_hybrid_llm(vllm_runner, socket_dir):
                 "mode": "embedded",
                 "capacity_bytes": 1 << 30,
                 "lookup_dir": socket_dir,
+                **options,
             },
         ),
     ) as runner:
@@ -223,3 +227,30 @@ def test_hybrid_restore_matches_local_prefix_hit(umbp_hybrid_llm):
         assert restored[0].num_cached_tokens == 2 * block_size
         assert _external_tokens(llm) - before == 2 * block_size
         _assert_same_outputs(local_hit, restored)
+
+
+@pytest.mark.parametrize(
+    "umbp_hybrid_llm",
+    [{"prefix_match_unit": 16, "enable_partial_hash_hits": True}],
+    ids=["unit16"],
+    indirect=True,
+)
+def test_hybrid_restores_a_boundary_inside_an_attention_block(umbp_hybrid_llm):
+    """A Mamba checkpoint inside an attention block restores like a GPU hit.
+
+    Mamba hybrids have no batch-invariant kernels, so the reference is a local
+    prefix hit rather than a cold run.
+    """
+    llm = umbp_hybrid_llm
+    block_size = llm.llm_engine.vllm_config.cache_config.block_size
+    prompt = _prompt(0, 2 * block_size + 40)
+    llm.generate(prompt, PARAMS, use_tqdm=False)
+    local_hit = llm.generate(prompt, PARAMS, use_tqdm=False)
+    assert local_hit[0].num_cached_tokens == 2 * block_size + 32
+    _reset_gpu_prefix_cache(llm)
+
+    before = _external_tokens(llm)
+    restored = llm.generate(prompt, PARAMS, use_tqdm=False)
+
+    assert _external_tokens(llm) - before == 2 * block_size + 32
+    _assert_same_outputs(local_hit, restored)
