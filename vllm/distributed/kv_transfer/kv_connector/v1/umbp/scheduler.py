@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -570,6 +571,42 @@ class UMBPStoreConnectorScheduler:
             self._lookup_wait_left_s -= time.monotonic() - started
         return future.done()
 
+    def _local_hit_keys(self, request: Request, hit_tokens: int) -> list[str]:
+        """Every rank's objects behind `hit_tokens` of a local prefix hit.
+
+        A prefix the GPU cache serves is never read back from the pool, so its
+        copies there age from their first store and are evicted first, then
+        lost in both tiers once the GPU evicts the prefix too.
+        """
+        hashes = request.block_hashes
+        unit = self.hash_block_size
+        if hit_tokens <= 0 or not hashes or self.codec is None:
+            return []
+        keys: list[str] = []
+        for group_id in self.kv_cache_config.prefix_cacheable_group_ids:
+            if group_id in self._boundary_handoff_groups:
+                ends = [hit_tokens]
+            else:
+                block_size = self.group_block_sizes[group_id]
+                ends = list(range(block_size, hit_tokens + 1, block_size))
+                if group_id in self._attention_groups and hit_tokens % block_size:
+                    ends.append(self._attention_page_end(group_id, hit_tokens))
+            for end in ends:
+                index = end // unit - 1
+                if 0 <= index < len(hashes):
+                    keys.extend(
+                        _rank_keys(self.codec, self.topology, hashes[index], group_id)
+                    )
+        return list(dict.fromkeys(keys))
+
+    def _touch_async(self, keys: list[str]) -> None:
+        touch = getattr(self.runtime, "touch", None)
+        if not keys or not callable(touch):
+            return
+        # The executor shuts down at close; a lost recency hint is harmless.
+        with contextlib.suppress(RuntimeError):
+            self._lookup_executor.submit(touch, keys)
+
     def _build_lookup_context(
         self, request: Request, local_tokens: int, hashes: tuple[bytes, ...]
     ) -> _LookupContext:
@@ -704,9 +741,20 @@ class UMBPStoreConnectorScheduler:
             pending = self._pending_lookups.pop(request_id, None)
             if pending is not None:
                 pending.future.cancel()
+        touch_keys: list[str] = []
         for request in scheduler_output.scheduled_new_reqs:
             load_plans = self._pending_loads.pop(request.req_id, [])
-            self._load_specs.pop(request.req_id, None)
+            spec = self._load_specs.pop(request.req_id, None)
+            tracked = self._requests.get(request.req_id)
+            if self.enable_lookup and tracked is not None:
+                # A loaded prefix is refreshed by the read itself; only the part
+                # the GPU cache served needs a recency hint.
+                local_hit = (
+                    spec.local_tokens
+                    if load_plans and spec is not None
+                    else request.num_computed_tokens
+                )
+                touch_keys.extend(self._local_hit_keys(tracked, local_hit))
             if load_plans:
                 meta.load_requests[request.req_id] = load_plans
             else:
@@ -741,6 +789,8 @@ class UMBPStoreConnectorScheduler:
                 if store_plans:
                     meta.store_requests[request.req_id] = store_plans
                     reserved_store_keys.update(store_plans.keys)
+
+        self._touch_async(touch_keys)
 
         block_state = getattr(scheduler_output, "kv_connector_block_state", None)
         cached_reqs = scheduler_output.scheduled_cached_reqs

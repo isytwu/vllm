@@ -64,6 +64,8 @@ def _rank_namespace_from_key_prefix(prefix: str) -> tuple[int, int, int, int] | 
 class _LookupClient(Protocol):
     def batch_exists(self, keys: Sequence[str]) -> Sequence[bool]: ...
 
+    def batch_touch(self, keys: Sequence[str]) -> int: ...
+
     def clear(self) -> bool: ...
 
 
@@ -163,6 +165,10 @@ class _MoriLookupServer:
                         connection.sendall(
                             msgspec.json.encode(bool(self.client.clear())) + b"\n"
                         )
+                        continue
+                    if isinstance(payload, dict) and payload.get("op") == "touch":
+                        touched = self.client.batch_touch(payload.get("keys", []))
+                        connection.sendall(msgspec.json.encode(int(touched)) + b"\n")
                         continue
                     result = self.client.batch_exists(payload)
                     connection.sendall(
@@ -284,6 +290,18 @@ class _MoriSchedulerHandle(UMBPSchedulerHandle):
 
     def close(self) -> None:
         return
+
+    def touch(self, keys: Sequence[str]) -> None:
+        keys_by_rank: dict[tuple[int, int, int, int], list[str]] = {}
+        for key in keys:
+            rank = _rank_namespace_from_key_prefix(key.rpartition(":")[0] + ":")
+            if rank in self._paths:
+                keys_by_rank.setdefault(rank, []).append(key)
+        for rank, rank_keys in keys_by_rank.items():
+            try:
+                self._request(self._paths[rank], {"op": "touch", "keys": rank_keys})
+            except (OSError, ValueError) as exc:
+                logger.debug("UMBP touch unavailable for rank %s: %s", rank, exc)
 
     def clear(self) -> bool:
         success = True
@@ -494,6 +512,11 @@ class _MoriWorkerHandle(UMBPWorkerHandle):
 
     def batch_exists(self, keys: Sequence[str]) -> Sequence[bool]:
         return [bool(value) for value in self.client.batch_exists(keys)]
+
+    def batch_touch(self, keys: Sequence[str]) -> int:
+        # MORI builds without BatchTouch keep commit/read recency only.
+        touch = getattr(self.client, "batch_touch", None)
+        return int(touch(list(keys))) if callable(touch) and keys else 0
 
     def clear(self) -> bool:
         return bool(self.client.clear())
