@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from itertools import islice
@@ -247,6 +247,17 @@ class UMBPStoreConnectorScheduler:
             self.load_async = True
         self.enable_lookup = bool(extra.get("enable_lookup", True))
         self.lookup_async = bool(extra.get("lookup_async", False))
+        lookup_wait_ms = extra.get("lookup_wait_ms", 20)
+        lookup_wait_budget_ms = extra.get("lookup_wait_budget_ms", 50)
+        for name, value in (
+            ("lookup_wait_ms", lookup_wait_ms),
+            ("lookup_wait_budget_ms", lookup_wait_budget_ms),
+        ):
+            if type(value) not in (int, float) or value < 0:
+                raise ValueError(f"{name} must be a non-negative number")
+        self._lookup_wait_s = lookup_wait_ms / 1000
+        self._lookup_wait_budget_s = lookup_wait_budget_ms / 1000
+        self._lookup_wait_left_s = self._lookup_wait_budget_s
         self.save_decode_cache = bool(extra.get("save_decode_cache", False))
         # A kv_consumer only restores from the pool, as with other store
         # connectors; it never offloads its own KV.
@@ -443,11 +454,13 @@ class UMBPStoreConnectorScheduler:
         if pending is None:
             context = self._build_lookup_context(request, num_computed_tokens, hashes)
             if self.lookup_async:
-                self._pending_lookups[request.request_id] = _PendingLookup(
+                pending = _PendingLookup(
                     context,
                     self._lookup_executor.submit(self.runtime.lookup, context.keys),
                 )
-                return None, False
+                if not self._wait_for_lookup(pending.future):
+                    self._pending_lookups[request.request_id] = pending
+                    return None, False
         else:
             context = self._pending_lookups.pop(request.request_id).context
         try:
@@ -543,6 +556,19 @@ class UMBPStoreConnectorScheduler:
         ):
             load_async = False
         return need_to_load, load_async
+
+    def _wait_for_lookup(self, future: Future[Sequence[bool]]) -> bool:
+        """Whether `future` finished within this scheduling step's wait budget.
+
+        A deferred request waits at least one engine step for its lookup, while
+        most lookups answer in a few milliseconds.
+        """
+        timeout = min(self._lookup_wait_s, self._lookup_wait_left_s)
+        if timeout > 0:
+            started = time.monotonic()
+            wait((future,), timeout=timeout)
+            self._lookup_wait_left_s -= time.monotonic() - started
+        return future.done()
 
     def _build_lookup_context(
         self, request: Request, local_tokens: int, hashes: tuple[bytes, ...]
@@ -665,6 +691,8 @@ class UMBPStoreConnectorScheduler:
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         meta = UMBPConnectorMetadata(async_load=self.load_async)
+        # This step's lookups are done; the next step gets a new wait budget.
+        self._lookup_wait_left_s = self._lookup_wait_budget_s
         reserved_store_keys = {
             key for event in self._store_events.values() for key in event.iter_keys()
         }
