@@ -24,6 +24,9 @@ class UMBPSchedulerHandle(Protocol):
     def clear(self) -> bool:
         """Clear all objects visible to this scheduler handle."""
 
+    def touch(self, keys: Sequence[str]) -> None:
+        """Count stored objects as just used without reading them (optional)."""
+
     def close(self) -> None:
         """Release scheduler-side resources."""
 

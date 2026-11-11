@@ -142,6 +142,11 @@ examples above. An object can be evicted between lookup and load; the default
 
 With `kv_role: "kv_consumer"` the connector only restores and never stores.
 
+When a request reuses a prefix from the GPU prefix cache, the scheduler also
+marks that prefix's objects in the pool as recently used, so the pool does not
+evict them before the GPU cache drops the prefix. This needs a MORI build with
+`BatchTouch`; older builds skip it.
+
 ## Limitations
 
 - Pipeline parallelism is rejected.
