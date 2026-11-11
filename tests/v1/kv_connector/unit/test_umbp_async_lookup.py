@@ -13,6 +13,7 @@ from tests.v1.kv_connector.umbp_test_utils import (
     _kv_cache_config,
     _SchedulerHandle,
     _vllm_config,
+    make_scheduler_output,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.umbp.data import (
     BlockIdentityCodec,
@@ -195,3 +196,77 @@ def test_async_lookup_failure_recomputes_and_allows_retry(failure):
             handle.hits = [True]
     finally:
         scheduler.close()
+
+
+class _AllHitsHandle(_SchedulerHandle):
+    def lookup(self, keys):
+        return [True] * len(keys)
+
+
+def _async_request(request_id: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        request_id=request_id, num_tokens=32, block_hashes=[b"a", b"b"]
+    )
+
+
+def test_async_lookup_answered_within_the_wait_is_used_at_once():
+    scheduler = UMBPStoreConnectorScheduler(
+        _vllm_config(
+            {"lookup_async": True, "load_async": False, "lookup_wait_ms": 5000}
+        ),
+        _kv_cache_config(),
+        _AllHitsHandle([]),
+        BlockIdentityCodec(UMBPNamespace("async-wait")),
+    )
+    try:
+        assert scheduler.get_num_new_matched_tokens(_async_request("r"), 0) == (
+            16,
+            False,
+        )
+    finally:
+        scheduler.close()
+
+
+def test_async_lookup_waits_at_most_the_budget_per_scheduling_step():
+    gate = threading.Event()
+
+    class _GatedHandle(_SchedulerHandle):
+        def lookup(self, keys):
+            gate.wait(timeout=5)
+            return [True] * len(keys)
+
+    scheduler = UMBPStoreConnectorScheduler(
+        _vllm_config(
+            {"lookup_async": True, "lookup_wait_ms": 200, "lookup_wait_budget_ms": 50}
+        ),
+        _kv_cache_config(),
+        _GatedHandle([]),
+        BlockIdentityCodec(UMBPNamespace("async-budget")),
+    )
+    try:
+        started = time.monotonic()
+        for index in range(5):
+            request = _async_request(f"r{index}")
+            assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+        # Without the budget, five unanswered lookups would wait one second.
+        assert time.monotonic() - started < 0.5
+
+        scheduler.build_connector_meta(make_scheduler_output())
+        started = time.monotonic()
+        request = _async_request("next-step")
+        assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+        assert time.monotonic() - started >= 0.04
+    finally:
+        gate.set()
+        scheduler.close()
+
+
+@pytest.mark.parametrize("option", ["lookup_wait_ms", "lookup_wait_budget_ms"])
+def test_lookup_wait_options_must_be_non_negative(option):
+    with pytest.raises(ValueError, match=option):
+        UMBPStoreConnectorScheduler(
+            _vllm_config({option: -1}),
+            _kv_cache_config(),
+            _SchedulerHandle([]),
+            BlockIdentityCodec(UMBPNamespace("invalid-wait")),
+        )
