@@ -772,6 +772,94 @@ def test_scheduler_stores_exact_hybrid_boundary_state():
     assert plan.key == scheduler.codec.key(b"a", 1)
 
 
+@pytest.mark.parametrize(
+    ("use_eagle", "prompt_tokens", "page_hash_index"),
+    [(False, 22, 4), (True, 26, 5)],
+)
+def test_boundary_inside_attention_block_stores_its_attention_page(
+    monkeypatch, use_eagle, prompt_tokens, page_hash_index
+):
+    """Core hands off only the state page of a boundary; resuming inside an
+    attention block also needs that block's page. EAGLE matches attention one
+    hash unit past the boundary, so its page is keyed there."""
+    monkeypatch.setattr(
+        umbp_scheduler, "resolve_kv_cache_block_sizes", lambda *args: (16, 4)
+    )
+    hashes = [bytes([index + 1]) * 4 for index in range(8)]
+    codec = BlockIdentityCodec(UMBPNamespace("attention-page"))
+
+    def make_scheduler(hits):
+        vllm_config = _vllm_config(
+            {"mode": "embedded", "enable_partial_hash_hits": True},
+            prefix_match_unit=4,
+        )
+        if use_eagle:
+            vllm_config.speculative_config = SimpleNamespace(
+                use_eagle_block_drop=lambda: True
+            )
+        return UMBPStoreConnectorScheduler(
+            vllm_config, _hybrid_kv_cache_config(), _SchedulerHandle(hits), codec
+        )
+
+    first = make_scheduler({})
+    request = make_request(
+        "turn-1",
+        num_tokens=prompt_tokens,
+        block_hashes=hashes[: prompt_tokens // 4],
+        block_ids=([3, 4], [6, 7]),
+    )
+    try:
+        first.update_state_after_alloc(
+            request,
+            SimpleNamespace(get_block_ids=lambda group_ids: ([3, 4], [6, 7])),
+            0,
+        )
+        metadata = first.build_connector_meta(
+            make_scheduler_output(
+                new_reqs=[
+                    SimpleNamespace(
+                        req_id="turn-1",
+                        num_computed_tokens=0,
+                        block_ids=([3, 4], [6, 7]),
+                    )
+                ],
+                scheduled_tokens={"turn-1": prompt_tokens},
+                block_state=SimpleNamespace(
+                    boundary_state_offloads={"turn-1": [(1, 9, 20)]}
+                ),
+            )
+        )
+    finally:
+        first.close()
+    stored = {
+        plan.key: (plan.group_id, plan.block_id) for plan in metadata.iter_store_plans()
+    }
+    # The full block [0, 16), the attention page holding [16, 20), the state.
+    assert stored == {
+        codec.key(hashes[3], 0): (0, 3),
+        codec.key(hashes[page_hash_index], 0): (0, 4),
+        codec.key(hashes[4], 1): (1, 9),
+    }
+
+    second = make_scheduler(dict.fromkeys(stored, True))
+    try:
+        next_turn = make_request("turn-2", num_tokens=32, block_hashes=hashes)
+        assert second.get_num_new_matched_tokens(next_turn, 0) == (20, True)
+        second.update_state_after_alloc(
+            next_turn,
+            SimpleNamespace(get_block_ids=lambda group_ids: ([11, 12], [13, 14])),
+            20,
+        )
+        loads = second._pending_loads["turn-2"]
+        assert dict(zip(loads.keys, loads.block_ids)) == {
+            codec.key(hashes[3], 0): 11,
+            codec.key(hashes[page_hash_index], 0): 12,
+            codec.key(hashes[4], 1): 14,
+        }
+    finally:
+        second.close()
+
+
 @pytest.mark.parametrize("local_tokens", [0, 16])
 def test_scheduler_partial_prefix_loads_full_page_at_absolute_index(
     local_tokens, monkeypatch
@@ -895,6 +983,53 @@ def test_finished_hybrid_tail_pins_full_pages_until_all_workers_finish():
         )
         assert [block.ref_cnt for block in blocks] == ([1, 1] if rank == 0 else [0, 0])
     assert not scheduler.has_pending_push_work()
+
+
+@pytest.mark.parametrize("use_eagle", [False, True])
+def test_finished_hybrid_tail_keys_its_attention_page_like_core(use_eagle):
+    """With EAGLE the attention page of a boundary is matched one hash unit
+    past it, where core registers its own partial tail."""
+    vllm_config = _vllm_config(
+        {"mode": "embedded", "load_async": False, "enable_partial_hash_hits": True},
+        prefix_match_unit=4,
+    )
+    if use_eagle:
+        vllm_config.speculative_config = SimpleNamespace(
+            use_eagle_block_drop=lambda: True
+        )
+    scheduler = UMBPStoreConnectorScheduler(
+        vllm_config,
+        _hybrid_kv_cache_config(),
+        _SchedulerHandle([]),
+        BlockIdentityCodec(UMBPNamespace("finished-tail-page")),
+    )
+    request = make_request(
+        "finished",
+        num_tokens=16,
+        block_hashes=[b"a", b"b", b"c", b"d"],
+        block_ids=([7], [9]),
+        num_computed_tokens=8,
+    )
+    try:
+        scheduler.update_state_after_alloc(
+            request, SimpleNamespace(get_block_ids=lambda group_ids: ([7], [9])), 0
+        )
+        scheduler.bind_gpu_block_pool(BlockPool(16, True, 4))
+        assert not scheduler.register_finished_partial_tail(
+            request, ([7], [9]), [(1, 9, 8)]
+        )
+        metadata = scheduler.build_connector_meta(
+            make_scheduler_output(finished={request.request_id})
+        )
+        attention_hash = b"c" if use_eagle else b"b"
+        assert {
+            (plan.group_id, plan.block_id, plan.key) for plan in metadata.store_plans
+        } == {
+            (0, 7, scheduler.codec.key(attention_hash, 0)),
+            (1, 9, scheduler.codec.key(b"b", 1)),
+        }
+    finally:
+        scheduler.close()
 
 
 @pytest.mark.parametrize(

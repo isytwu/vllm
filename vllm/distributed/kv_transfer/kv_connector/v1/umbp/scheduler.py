@@ -205,6 +205,16 @@ class UMBPStoreConnectorScheduler:
             if isinstance(group.kv_cache_spec, MambaSpec)
             and getattr(group.kv_cache_spec, "mamba_cache_mode", None) == "align"
         )
+        self._attention_groups = frozenset(
+            group_id
+            for group_id in kv_cache_config.prefix_cacheable_group_ids
+            if isinstance(
+                _unwrap_store_spec(
+                    kv_cache_config.kv_cache_groups[group_id].kv_cache_spec
+                ),
+                FullAttentionSpec,
+            )
+        )
         self.runtime = runtime
         self.enable_kv_cache_events = bool(
             vllm_config.kv_events_config
@@ -327,6 +337,18 @@ class UMBPStoreConnectorScheduler:
             )
             for group_id in kv_cache_config.prefix_cacheable_group_ids
         }
+        # The coordinator matches these groups one lookup unit past a hit and
+        # then drops that unit (EAGLE).
+        self._eagle_lookup_groups = frozenset(
+            group_id
+            for group_id, manager in zip(
+                kv_cache_config.prefix_cacheable_group_ids,
+                self._lookup_coordinator.single_type_managers
+                if self._lookup_coordinator is not None
+                else (),
+            )
+            if manager.use_eagle
+        )
         self._pending_lookups: dict[str, _PendingLookup] = {}
         self._lookup_executor = ThreadPoolExecutor(
             max_workers=int(extra.get("lookup_workers", 2)),
@@ -838,6 +860,7 @@ class UMBPStoreConnectorScheduler:
                 )
                 continue
             plans: list[BlockTransferPlan] = []
+            boundaries: set[int] = set()
             for group_id, block_id, boundary_tokens in entries:
                 if group_id not in prefix_groups or block_id == NULL_BLOCK_ID:
                     continue
@@ -862,6 +885,11 @@ class UMBPStoreConnectorScheduler:
                         block_size=self.group_block_sizes[group_id],
                     )
                 )
+                boundaries.add(boundary_tokens)
+            for boundary in sorted(boundaries):
+                plans.extend(
+                    self._attention_page_plans(request, tracker.block_ids, boundary)
+                )
             logger.debug(
                 "UMBP boundary offloads request=%s offered=%d stored=%d boundaries=%s",
                 request_id,
@@ -871,6 +899,65 @@ class UMBPStoreConnectorScheduler:
             )
             if plans:
                 meta.store_plans.extend(plans)
+
+    def _attention_page_plans(
+        self,
+        request: Request,
+        block_ids: tuple[list[int], ...],
+        boundary: int,
+    ) -> list[BlockTransferPlan]:
+        """Attention pages a hybrid prefix needs to resume at `boundary`.
+
+        Core hands off only the state pages of a boundary. When the boundary
+        falls inside an attention block, that block's page holds the tokens
+        before it, and without it the prefix cannot resume there.
+        `block_ids` holds one list per prefix-cacheable group.
+        """
+        assert self.codec is not None
+        plans: list[BlockTransferPlan] = []
+        for index, group_id in enumerate(
+            self.kv_cache_config.prefix_cacheable_group_ids
+        ):
+            if group_id not in self._attention_groups or index >= len(block_ids):
+                continue
+            block_size = self.group_block_sizes[group_id]
+            end = self._attention_page_end(group_id, boundary)
+            # A block-aligned end is a full block, stored with its prefix.
+            if end % block_size == 0:
+                continue
+            hash_index = end // self.hash_block_size - 1
+            if not 0 <= hash_index < len(request.block_hashes):
+                continue
+            group_block_ids = block_ids[index]
+            block_index = end // block_size
+            if (
+                block_index >= len(group_block_ids)
+                or group_block_ids[block_index] == NULL_BLOCK_ID
+            ):
+                continue
+            block_hash = request.block_hashes[hash_index]
+            plans.append(
+                BlockTransferPlan(
+                    key=self.codec.key(block_hash, group_id),
+                    block_id=group_block_ids[block_index],
+                    request_id=request.request_id,
+                    group_id=group_id,
+                    block_hash=block_hash,
+                    parent_block_hash=(
+                        request.block_hashes[hash_index - 1]
+                        if self.enable_kv_cache_events and hash_index > 0
+                        else None
+                    ),
+                    block_size=block_size,
+                )
+            )
+        return plans
+
+    def _attention_page_end(self, group_id: int, boundary: int) -> int:
+        """Token position the attention page restoring `boundary` is keyed at."""
+        if group_id in self._eagle_lookup_groups:
+            return boundary + self._lookup_units[group_id]
+        return boundary
 
     def _tracker_for_request(self, request_id: str) -> RequestTracker:
         return self._request_trackers.setdefault(request_id, RequestTracker())
@@ -1195,8 +1282,7 @@ class UMBPStoreConnectorScheduler:
             or bool(getattr(request, "num_in_flight_tokens", 0))
         ):
             return False
-        hash_index = boundary // self.hash_block_size - 1
-        if hash_index >= len(request.block_hashes):
+        if boundary // self.hash_block_size > len(request.block_hashes):
             return False
         sources = {
             group_id: block_id for group_id, block_id, _ in partial_tail_offloads
@@ -1205,31 +1291,38 @@ class UMBPStoreConnectorScheduler:
             return False
         # Core hands off Mamba state pages. Include the matching FA tail page
         # so every group can resolve the same fine-grained prefix boundary.
-        for group_id in prefix_groups:
-            spec = self.kv_cache_config.kv_cache_groups[group_id].kv_cache_spec
-            if (
-                isinstance(spec, FullAttentionSpec)
-                and boundary % self.group_block_sizes[group_id]
-            ):
-                index = boundary // self.group_block_sizes[group_id]
-                if index >= len(block_ids[group_id]):
-                    return False
-                sources.setdefault(group_id, block_ids[group_id][index])
+        key_ends = dict.fromkeys(sources, boundary)
+        for group_id in self.kv_cache_config.prefix_cacheable_group_ids:
+            if group_id not in self._attention_groups:
+                continue
+            end = self._attention_page_end(group_id, boundary)
+            group_block_size = self.group_block_sizes[group_id]
+            if end % group_block_size == 0:
+                continue
+            index = end // group_block_size
+            if index >= len(block_ids[group_id]):
+                return False
+            if end // self.hash_block_size > len(request.block_hashes):
+                return False
+            sources.setdefault(group_id, block_ids[group_id][index])
+            key_ends.setdefault(group_id, end)
         plans: list[BlockTransferPlan] = []
         for group_id, block_id in sources.items():
             if block_id == NULL_BLOCK_ID or not 0 <= block_id < len(pool.blocks):
                 return False
             if pool.blocks[block_id].is_null:
                 return False
-            group_block_size = self.group_block_sizes[group_id]
+            block_hash = request.block_hashes[
+                key_ends[group_id] // self.hash_block_size - 1
+            ]
             plans.append(
                 BlockTransferPlan(
                     request_id=request.request_id,
                     block_id=block_id,
                     group_id=group_id,
-                    key=self.codec.key(request.block_hashes[hash_index], group_id),
-                    block_hash=request.block_hashes[hash_index],
-                    block_size=group_block_size,
+                    key=self.codec.key(block_hash, group_id),
+                    block_hash=block_hash,
+                    block_size=self.group_block_sizes[group_id],
                 )
             )
         # A Mamba page is a state snapshot, not a token-addressable byte array.
