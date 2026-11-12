@@ -45,6 +45,10 @@ _LOOKUP_TIMEOUT_S = 1.0
 _STORE_RETRIES = 2
 _STORE_RETRY_BACKOFF_S = 0.01
 
+# MORI's own 0.9/0.7 frees a fifth of the pool each time it fills, which keeps
+# a KV cache about 80% full.
+_DEFAULT_DRAM_WATERMARKS = {"dram_high_watermark": 0.99, "dram_low_watermark": 0.97}
+
 _RANK_KEY_PATTERN = re.compile(r":tp(\d+):pcp(\d+):dcp(\d+):pp(\d+):g\d+:")
 
 
@@ -59,6 +63,8 @@ def _rank_namespace_from_key_prefix(prefix: str) -> tuple[int, int, int, int] | 
 
 class _LookupClient(Protocol):
     def batch_exists(self, keys: Sequence[str]) -> Sequence[bool]: ...
+
+    def batch_touch(self, keys: Sequence[str]) -> int: ...
 
     def clear(self) -> bool: ...
 
@@ -159,6 +165,10 @@ class _MoriLookupServer:
                         connection.sendall(
                             msgspec.json.encode(bool(self.client.clear())) + b"\n"
                         )
+                        continue
+                    if isinstance(payload, dict) and payload.get("op") == "touch":
+                        touched = self.client.batch_touch(payload.get("keys", []))
+                        connection.sendall(msgspec.json.encode(int(touched)) + b"\n")
                         continue
                     result = self.client.batch_exists(payload)
                     connection.sendall(
@@ -282,6 +292,18 @@ class _MoriSchedulerHandle(UMBPSchedulerHandle):
 
     def close(self) -> None:
         return
+
+    def touch(self, keys: Sequence[str]) -> None:
+        keys_by_rank: dict[tuple[int, int, int, int], list[str]] = {}
+        for key in keys:
+            rank = _rank_namespace_from_key_prefix(key.rpartition(":")[0] + ":")
+            if rank in self._paths:
+                keys_by_rank.setdefault(rank, []).append(key)
+        for rank, rank_keys in keys_by_rank.items():
+            try:
+                self._request(self._paths[rank], {"op": "touch", "keys": rank_keys})
+            except (OSError, ValueError) as exc:
+                logger.debug("UMBP touch unavailable for rank %s: %s", rank, exc)
 
     def clear(self) -> bool:
         success = True
@@ -492,6 +514,11 @@ class _MoriWorkerHandle(UMBPWorkerHandle):
 
     def batch_exists(self, keys: Sequence[str]) -> Sequence[bool]:
         return [bool(value) for value in self.client.batch_exists(keys)]
+
+    def batch_touch(self, keys: Sequence[str]) -> int:
+        # MORI builds without BatchTouch keep commit/read recency only.
+        touch = getattr(self.client, "batch_touch", None)
+        return int(touch(list(keys))) if callable(touch) and keys else 0
 
     def clear(self) -> bool:
         return bool(self.client.clear())
@@ -767,6 +794,8 @@ def _configure_dram(client_config: Any, options: dict[str, Any]) -> None:
     """Apply embedded-only host-DRAM options to MORI's client config."""
     dram = client_config.dram
     dram.capacity_bytes = options.get("capacity_bytes", 64 * 1024**3)
+    if not _DEFAULT_DRAM_WATERMARKS.keys() & options.keys():
+        options = {**_DEFAULT_DRAM_WATERMARKS, **options}
     option_fields = {
         "dram_use_shared_memory": "use_shared_memory",
         "dram_shm_name": "shm_name",

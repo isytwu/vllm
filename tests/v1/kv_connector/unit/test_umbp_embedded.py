@@ -359,6 +359,18 @@ def test_runtime_config_rejects_invalid_embedded_dram_options(options, error):
         )
 
 
+def test_embedded_dram_watermarks_default_only_when_neither_is_set():
+    unset = SimpleNamespace(dram=SimpleNamespace())
+    embedded._configure_dram(unset, {"capacity_bytes": 1024})
+    assert (unset.dram.high_watermark, unset.dram.low_watermark) == (0.99, 0.97)
+
+    # Setting one keeps MORI's default for the other.
+    one = SimpleNamespace(dram=SimpleNamespace())
+    embedded._configure_dram(one, {"capacity_bytes": 1024, "dram_high_watermark": 0.95})
+    assert one.dram.high_watermark == 0.95
+    assert not hasattr(one.dram, "low_watermark")
+
+
 def test_mori_client_is_created_only_for_worker(monkeypatch, socket_dir):
     """Scheduler lookup must not allocate a second, unused DRAM store."""
     monkeypatch.setitem(sys.modules, "mori.cpp", None)
@@ -557,6 +569,42 @@ def test_single_rank_lookup_returns_fresh_results(socket_dir):
     finally:
         scheduler.close()
         server.close()
+
+
+def test_touch_reaches_the_rank_that_holds_each_key(socket_dir):
+    class _Client:
+        def __init__(self):
+            self.touched: list[str] = []
+
+        def batch_exists(self, keys):
+            return [False] * len(keys)
+
+        def batch_touch(self, keys):
+            self.touched.extend(keys)
+            return len(keys)
+
+    namespace = "routed-touch"
+    topology = RankTopology(tp_size=2)
+    keys = [
+        BlockIdentityCodec(UMBPNamespace(namespace), tp_rank=rank).key(b"a")
+        for rank in range(2)
+    ]
+    clients = [_Client(), _Client()]
+    servers = []
+    for rank, client in zip(topology.all_namespaces(), clients, strict=True):
+        server = _MoriLookupServer(
+            _lookup_socket_path(namespace, rank, socket_dir), client
+        )
+        server.start()
+        servers.append(server)
+    scheduler = _MoriSchedulerHandle(namespace, topology, socket_dir)
+    try:
+        scheduler.touch([*keys, "legacy-key"])
+        assert [client.touched for client in clients] == [[keys[0]], [keys[1]]]
+    finally:
+        scheduler.close()
+        for server in servers:
+            server.close()
 
 
 @pytest.mark.parametrize("flush_succeeds", [False, True])

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib.util
+import threading
 import time
 from dataclasses import replace
 from types import SimpleNamespace
@@ -770,6 +771,56 @@ def test_scheduler_stores_exact_hybrid_boundary_state():
     assert plan.group_id == 1
     assert plan.block_id == 9
     assert plan.key == scheduler.codec.key(b"a", 1)
+
+
+def test_admitted_local_hit_refreshes_its_pool_objects(monkeypatch):
+    """A prefix the GPU cache serves still counts as used in the pool: the full
+    attention block and the state the hit resumes from."""
+    monkeypatch.setattr(
+        umbp_scheduler, "resolve_kv_cache_block_sizes", lambda *args: (16, 4)
+    )
+    hashes = [bytes([index + 1]) * 4 for index in range(8)]
+    codec = BlockIdentityCodec(UMBPNamespace("local-hit-touch"))
+    touched: list[str] = []
+    done = threading.Event()
+
+    class _TouchHandle(_SchedulerHandle):
+        def touch(self, keys):
+            touched.extend(keys)
+            done.set()
+
+    scheduler = UMBPStoreConnectorScheduler(
+        _vllm_config(
+            {"mode": "embedded", "enable_partial_hash_hits": True},
+            prefix_match_unit=4,
+        ),
+        _hybrid_kv_cache_config(),
+        _TouchHandle({}),
+        codec,
+    )
+    request = make_request(
+        "hit", num_tokens=32, block_hashes=hashes, block_ids=([3, 4], [6, 7])
+    )
+    try:
+        scheduler.update_state_after_alloc(
+            request,
+            SimpleNamespace(get_block_ids=lambda group_ids: ([3, 4], [6, 7])),
+            0,
+        )
+        scheduler.build_connector_meta(
+            make_scheduler_output(
+                new_reqs=[
+                    SimpleNamespace(
+                        req_id="hit", num_computed_tokens=20, block_ids=([3, 4], [6, 7])
+                    )
+                ],
+                scheduled_tokens={"hit": 12},
+            )
+        )
+        assert done.wait(timeout=5)
+    finally:
+        scheduler.close()
+    assert touched == [codec.key(hashes[3], 0), codec.key(hashes[4], 1)]
 
 
 @pytest.mark.parametrize("local_tokens", [0, 16])
