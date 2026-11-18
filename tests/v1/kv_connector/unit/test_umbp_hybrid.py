@@ -621,6 +621,54 @@ def test_hybrid_lookup_uses_latest_mamba_checkpoint(lookup_async, monkeypatch):
         scheduler.close()
 
 
+@pytest.mark.parametrize("lookup_async", [False, True])
+@pytest.mark.parametrize(
+    ("states", "expected", "asked"),
+    [
+        # The state at the attention hit's end (a boundary page at 40).
+        ((16, 32, 40), 40, (40,)),
+        # None there: down one position at a time to the next one.
+        ((16, 32), 32, (40, 36, 32)),
+        # Past the probe depth, the rest are asked about together.
+        ((16,), 16, (40, 36, 32, 28, 4, 8, 12, 16, 20, 24)),
+    ],
+)
+def test_hybrid_lookup_asks_for_states_down_from_the_attention_hit(
+    lookup_async, states, expected, asked
+):
+    codec = BlockIdentityCodec(UMBPNamespace("state-probe"))
+    block_hashes = [bytes([index]) for index in range(12)]
+    hits = {codec.key(block_hashes[end // 4 - 1], 0): True for end in (16, 32, 40)}
+    hits.update({codec.key(block_hashes[end // 4 - 1], 1): True for end in states})
+    handle = _SchedulerHandle(hits)
+    scheduler = UMBPStoreConnectorScheduler(
+        _vllm_config(
+            {"mode": "embedded", "lookup_async": lookup_async}, prefix_match_unit=4
+        ),
+        _hybrid_kv_cache_config(),
+        handle,
+        codec,
+    )
+    try:
+        request = make_request("state-probe", block_hashes=block_hashes, num_tokens=49)
+        matched, is_async = scheduler.get_num_new_matched_tokens(request, 0)
+        deadline = time.monotonic() + 5
+        while matched is None and time.monotonic() < deadline:
+            time.sleep(0.001)
+            matched, is_async = scheduler.get_num_new_matched_tokens(request, 0)
+
+        assert (matched, is_async) == (expected, True)
+        state_keys = {
+            codec.key(block_hash, 1): (index + 1) * 4
+            for index, block_hash in enumerate(block_hashes)
+        }
+        assert [
+            state_keys[key] for query in handle.queries for key in query if key in state_keys
+        ] == list(asked)
+    finally:
+        scheduler.close()
+
+
 @pytest.mark.parametrize("failure_stage", ["lookup", "match"])
 def test_hybrid_shadow_lookup_cleans_up_after_failure(monkeypatch, failure_stage):
     """A failed query cannot leak shadow hits or consume pool capacity."""
@@ -904,14 +952,21 @@ def test_scheduler_partial_prefix_loads_full_page_at_absolute_index(
 
 
 def test_hybrid_fine_hash_lookup_is_not_limited_by_gpu_page_count():
+    codec = BlockIdentityCodec(UMBPNamespace("many-hashes"))
     scheduler = UMBPStoreConnectorScheduler(
         _vllm_config(
             {"load_async": False, "enable_partial_hash_hits": True},
             prefix_match_unit=4,
         ),
         _hybrid_kv_cache_config(),
-        _SchedulerHandle([True] * 62),
-        BlockIdentityCodec(UMBPNamespace("many-hashes")),
+        _SchedulerHandle(
+            {
+                codec.key(bytes([index]), group_id): True
+                for index in range(32)
+                for group_id in (0, 1)
+            }
+        ),
+        codec,
     )
     try:
         request = make_request(

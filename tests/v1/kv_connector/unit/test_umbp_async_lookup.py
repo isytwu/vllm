@@ -111,9 +111,9 @@ def test_async_lookup_discards_results_for_changed_request(monkeypatch, change):
     )
     queries = []
 
-    def submit(fn, keys):
+    def submit(fn, context):
         future: Future[list[bool]] = Future()
-        queries.append((keys, future))
+        queries.append((context.keys, future))
         return future
 
     monkeypatch.setattr(scheduler._lookup_executor, "submit", submit)

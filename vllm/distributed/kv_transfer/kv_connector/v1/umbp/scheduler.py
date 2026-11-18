@@ -63,6 +63,10 @@ from .runtime import UMBPSchedulerHandle
 
 logger = init_logger(__name__)
 
+# Mamba "align" positions a lookup asks about one at a time, down from where the
+# attention hit ends, before it asks about the rest together.
+_STATE_LOOKUP_DEPTH = 4
+
 
 @lru_cache(maxsize=8192)
 def _rank_keys(
@@ -445,7 +449,7 @@ class UMBPStoreConnectorScheduler:
             if self.lookup_async:
                 self._pending_lookups[request.request_id] = _PendingLookup(
                     context,
-                    self._lookup_executor.submit(self._lookup_all_ranks, context.keys),
+                    self._lookup_executor.submit(self._lookup_hits, context),
                 )
                 return None, False
         else:
@@ -454,7 +458,7 @@ class UMBPStoreConnectorScheduler:
             hits = list(
                 pending.future.result()
                 if pending is not None
-                else self._lookup_all_ranks(context.keys)
+                else self._lookup_hits(context)
             )
         except Exception as exc:
             logger.debug("UMBP lookup failed request=%s: %s", request.request_id, exc)
@@ -597,6 +601,112 @@ class UMBPStoreConnectorScheduler:
                 position * (ranks - 1) : (position + 1) * (ranks - 1)
             ]
         return hits
+
+    def _lookup_hits(self, context: _LookupContext) -> list[bool]:
+        """Look up a context's keys, asking about Mamba "align" states only
+        down from where the attention hit ends, until every state group holds
+        one position.
+
+        A hybrid prompt has a state candidate at every lookup unit and a load
+        reads one of them. A runtime that renews what a lookup finds would
+        otherwise keep every checkpoint of every queued request over the KV that
+        other requests come back for. A key that is not asked about reads as
+        missing.
+        """
+        state_groups = [
+            group_id
+            for group_id in context.objects
+            if group_id in self._boundary_handoff_groups
+        ]
+        attention_groups = [
+            group_id for group_id in context.objects if group_id in self._attention_groups
+        ]
+        units = {self._lookup_units[group_id] for group_id in state_groups}
+        # EAGLE matches one unit past the hit and drops it, so the state a load
+        # reads need not sit at the attention hit's end.
+        if not state_groups or not attention_groups or len(units) != 1 or self.use_eagle:
+            return self._lookup_all_ranks(context.keys)
+        ranks = self.topology.rank_count
+        spans: dict[int, range] = {}
+        offset = 0
+        for group_id, objects in context.objects.items():
+            spans[group_id] = range(offset, offset + len(objects) * ranks)
+            offset += len(objects) * ranks
+        hits = [False] * len(context.keys)
+
+        def ask(indices: list[int]) -> None:
+            if not indices:
+                return
+            found = self._lookup_all_ranks([context.keys[index] for index in indices])
+            for index, hit in zip(indices, found, strict=True):
+                hits[index] = hit
+
+        ask(
+            [
+                index
+                for group_id in context.objects
+                if group_id not in state_groups
+                for index in spans[group_id]
+            ]
+        )
+        hit_end = min(
+            self._attention_hit_end(
+                context, group_id, hits[spans[group_id].start : spans[group_id].stop]
+            )
+            for group_id in attention_groups
+        )
+        (unit,) = units
+        last = (hit_end - context.local_tokens) // unit - 1
+        floor = max(last - _STATE_LOOKUP_DEPTH, -1)
+        for position in range(last, floor, -1):
+            indices = [
+                index
+                for group_id in state_groups
+                for index in spans[group_id][position * ranks : (position + 1) * ranks]
+            ]
+            assert self.runtime is not None
+            found = list(self.runtime.lookup([context.keys[index] for index in indices]))
+            if len(found) != len(indices):
+                raise ValueError("lookup returned an invalid result length")
+            if all(found):
+                for index in indices:
+                    hits[index] = True
+                return hits
+        ask(
+            [
+                index
+                for group_id in state_groups
+                for index in spans[group_id][: (floor + 1) * ranks]
+            ]
+        )
+        return hits
+
+    def _attention_hit_end(
+        self, context: _LookupContext, group_id: int, group_hits: Sequence[bool]
+    ) -> int:
+        """The token where an attention group's external hit can end: its block
+        boundaries held without a gap, then the last page it holds before the
+        first missing boundary (a hybrid boundary page)."""
+        ranks = self.topology.rank_count
+        held = [
+            all(group_hits[index : index + ranks])
+            for index in range(0, len(group_hits), ranks)
+        ]
+        unit = self._lookup_units[group_id]
+        block = self.group_block_sizes[group_id]
+        complete = 0
+        missing = len(held)
+        for index, holds in enumerate(held):
+            if (context.local_tokens + (index + 1) * unit) % block:
+                continue
+            if not holds:
+                missing = index
+                break
+            complete = index + 1
+        for index in range(missing - 1, complete - 1, -1):
+            if held[index]:
+                return context.local_tokens + (index + 1) * unit
+        return context.local_tokens + complete * unit
 
     def _coordinate_external_hits(
         self,
