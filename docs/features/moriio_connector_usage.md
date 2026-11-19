@@ -180,6 +180,28 @@ Advanced users can also configure MoRI itself using environment variables such a
 
 Use xGMI when the prefiller and decoder run on the same physical host so transfers go over the AMD GPU fabric and skip the NIC entirely. Currently only configured using MoRI-specific environment variables; see the [MoRI repository](https://github.com/rocm/mori).
 
+### KV cache in amdgpu GEM BOs
+
+amdgpu-dkms counts `hipMalloc` memory that a NIC pins twice in the KFD allocation limit: 30.x does so for dma-buf registrations (the only kind on hosts without peer memory), and 31.10 through 31.60 for every registration ([ROCm/mori#721](https://github.com/ROCm/mori/issues/721)). Once MoRIIO registers a KV cache larger than the VRAM left after allocating it, every later device allocation on that GPU fails. Typically all decode ranks report `HIP error 209: no kernel image is available` at the first request. To keep the KV cache in amdgpu GEM BOs instead, which KFD counts once, set `custom_mem_pool` on both instances:
+
+```bash
+--kv-transfer-config '{
+  "kv_connector": "MoRIIOConnector",
+  "kv_role": "kv_producer",
+  "kv_connector_extra_config": {
+    ...,
+    "custom_mem_pool": "AMD_GEM"
+  }
+}'
+```
+
+Requirements and limits:
+
+- MoRI must ship `mori.io.HipGemAllocator`.
+- It needs the RDMA backend: HIP has no IPC handle for these buffers, so the xGMI backend cannot open them.
+- The NIC that pins each buffer at allocation must pin dma-buf memory. AINIC (ionic) and Thor2 (bnxt_re) do; mlx5 does not. MoRI picks that NIC from `MORI_RDMA_DEVICES`.
+- It cannot be combined with `enable_cumem_allocator`, and it turns off the extensible KV cache.
+
 ## Multi-node deployment
 
 The example below shows how to run a 1P1D deployment on two nodes. We run the proxy on the same node as the prefill instance.

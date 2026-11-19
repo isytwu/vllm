@@ -288,6 +288,35 @@ def _warn_deprecated_env_vars() -> None:
             )
 
 
+# KV cache memory pools MoRIIOConnector can allocate from (custom_mem_pool).
+SUPPORTED_CUSTOM_MEM_POOLS = ("AMD_GEM",)
+
+
+def parse_custom_mem_pool(extra_config: dict[str, Any], backend: str) -> str | None:
+    """Validate ``custom_mem_pool`` in kv_connector_extra_config.
+
+    AMD_GEM allocates the KV cache as amdgpu GEM BOs (mori.io.HipGemAllocator).
+    amdgpu-dkms counts hipMalloc memory that a NIC pins twice in the KFD
+    allocation limit (30.x for dma-buf registrations, 31.10 - 31.60 for all), so
+    once a large KV cache is registered every later allocation fails; KFD counts
+    a GEM BO once.
+    """
+    pool_type = str(extra_config.get("custom_mem_pool") or "").upper()
+    if not pool_type:
+        return None
+    if pool_type not in SUPPORTED_CUSTOM_MEM_POOLS:
+        raise ValueError(
+            f"Unsupported custom_mem_pool={pool_type!r} for MoRIIOConnector; "
+            f"expected one of {SUPPORTED_CUSTOM_MEM_POOLS}."
+        )
+    if backend != "rdma":
+        raise ValueError(
+            f"custom_mem_pool={pool_type!r} needs the MoRIIO RDMA backend: HIP has "
+            "no IPC handle for GEM buffers, so the xGMI backend cannot open them."
+        )
+    return pool_type
+
+
 @dataclass
 class MoRIIOConfig:
     local_ip: str
@@ -310,6 +339,7 @@ class MoRIIOConfig:
     post_batch_size: int = -1
     num_workers: int = 1
     backend: str = "rdma"
+    custom_mem_pool: str | None = None
 
     @classmethod
     def from_vllm_config(cls, vllm_config: VllmConfig) -> "MoRIIOConfig":
@@ -408,6 +438,7 @@ class MoRIIOConfig:
             post_batch_size=int(extra_config.get("post_batch_size", -1)),
             num_workers=int(extra_config.get("num_workers", 1)),
             backend=backend,
+            custom_mem_pool=parse_custom_mem_pool(extra_config, backend),
             transfer_timeout=transfer_timeout,
             defer_timeout=defer_timeout,
             recv_abort_timeout=recv_abort_timeout,
