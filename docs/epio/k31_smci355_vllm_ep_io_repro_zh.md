@@ -329,15 +329,15 @@ python3 e2e/pd_analyze.py results/e2e/pd32_$J results/e2e/pd32t0_$J
 - `snaps.jsonl`：每个窗口在 IO 起来后（`_a`）和结束前（`_b`）各记一次 RDMA 计数器。
 - `serve_<node>.log` 是 decode 的日志，`prefill_<node>.log` 是 prefill 的，`proxy.log` 是代理的，`agentx/` 是 AIPerf 的完整输出。
 
-### F.2 判断 EP 有没有被 DCQCN 降速
+### F.2 判断 EP 有没有在交换机里排队
 
-decode 节点只发 EP 数据（以及 READ 请求）。它收到 CNP，就说明它的发送 QP 被要求降速了：
+decode 节点只发 EP 数据（以及 READ 请求）。它收到 CNP，就说明它发出的 EP 包在某个交换机端口排了队、被打了 ECN 标记：
 
 ```bash
 for i in 0 1 2 3 4 5 6 7; do cat /sys/class/infiniband/ionic_$i/ports/1/hw_counters/rx_rdma_cnp_pkts; done | paste -sd+ | bc
 ```
 
-每秒几千个以上，步时就会明显变慢。
+每秒几千个以上，步时就会明显变慢。注意 CNP 只是队列变深的信号：smci355 上 QP 默认绑在没开 DCQCN 的 profile 0，发送端收到 CNP 也不会降速（结论文档第 4 节）。EP32 没有 IO 时每台 decode 也有每秒 4–6 千个。
 
 ### F.3 可以调的旋钮
 
@@ -350,7 +350,8 @@ for i in 0 1 2 3 4 5 6 7; do cat /sys/class/infiniband/ionic_$i/ports/1/hw_count
 | EP 负载 | 每个 rank 的序列数（`MAX_SEQS`，`CONC`）；投机草稿 token 数（`SPEC_K`，qlen = `SPEC_K` + 1） |
 | EP 内核 | `serve.sh` 的 `A2A`（`--all2all-backend`，默认 `mori_low_latency`） |
 | rail 对齐 | `RAIL_ALIGN=1`，见 `mb/rail.sh` |
-| 交换机、网卡的 ECN / DCQCN | 不在工具包里。smci355 上一个来源就能让 EP 被降速，而 DO 上不会，最值得查的就是这里 |
+| 网卡的 DCQCN | 不在工具包里，要 root。smci355 的 QP 默认绑在 profile 0（`match_default` 0），没开 DCQCN；可以用 `nicctl` 把 QP 绑到开了 DCQCN 的 profile（`match_default` 或 `match_rules`）。另一组同事绑过，QP 状态里的 `rate_enforced`、`target_rate` 仍是 0，固件到底有没有限速要找 AINIC 确认。DCQCN 真正生效后，IO 会被限速、队列变浅，有可能就是一种缓解办法，值得用 case A 测 |
+| 交换机的缓冲、ECN 和 PFC 门限 | 不在工具包里。smci355 上一个来源就能让 EP 排队，DO 上不会，两边的差别最可能在这里，或者在 IO 的提交方式上 |
 
 ## G. 踩过的坑
 

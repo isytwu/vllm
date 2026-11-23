@@ -22,14 +22,14 @@ Moonshot 在 EP32、全局 batch 512、qlen 8 上看到过 IO 突发让 EP 明�
    - 1 台 decode 以线速从 C 读（MoRIIO 拉 KV 的方向）：+28%；4 台各收每股 5–10 GB/s 的 16 MB 突发：+25–27%；线速写进 1 台：+18%（三次都是 18% 左右）。
    - 每股 1 GB/s 也有 +13%。模拟真实到达的突发（每卡每秒一次 16 / 64 MB）没有影响。
    - 决定影响的是 IO 到达 decode 网卡时的瞬时速率：C 的网卡同时给 4 台连续发时，每股只有约 1/4 线速，反而只慢 10.5%。
-3. **机制是 ECN / DCQCN 把 EP 一起降速。**
+3. **机制是 EP 在交换机的同一个队列里排在 IO 后面（第 4 节）。**
    - 过程：
-     1. 一次提交几 MB 的 IO，会在 decode 入口的 TC 104 队列里堆起来；
-     2. 交换机给排队的包打 ECN 标记，EP 的包也一起被标记；
-     3. 接收方回 CNP，发送方网卡的 DCQCN 就给 EP 的 QP 降速；
-     4. EP 每一层要等最慢的 rank，所以整个 decode 变慢。
+     1. 一次提交几 MB 的 IO 以线速打进 decode，在 decode 入口的 TC 104 队列里堆起来；
+     2. EP 的包排在后面，延迟变长（排在 16 MB 后面，按 50 GB/s 算要多等约 300 µs）；
+     3. EP 每一层要等最慢的 rank，所以整个 decode 变慢。
+   - 交换机给排队的包打 ECN 标记、接收方回 CNP，说明队列确实堆深了。**但 smci355 上发送端并没有按 DCQCN 降速**：QP 默认绑在没开 DCQCN 的 profile 0；EP32 线速写进 1 台时，C 的每个 IO QP 每秒收到约 2.4 万个 CNP，IO 速率只比 TC 0 低 18%。
    - 整个过程没有 PFC，也没有重传。
-   - 只往一台 decode 写时，另一台没有收到任何 IO，却因为它发出去的 EP 被降速，每秒收到 6.4 万个 CNP，decode 整体慢 44%（第 4 节）。
+   - 只往一台 decode 写时，另一台没有收到任何 IO，却因为它发往被写那台的 EP 在那台的入口排队（每秒有 6.4 万个包被标记），decode 整体慢 44%。
    - EP32 没有 IO 时，EP 自己就在被 ECN 标记：每台 decode 每秒收到 4–6 千个 CNP（EP16 是 0）。每台要同时收另外 3 台的 EP，本身就是 incast。
 4. **有两种缓解办法，在端到端里都验证过。EP32 上 TC 0 仍然完全有效，拆小只能减轻：**
    - 把 IO 放进另一个流量类（TC 0）：EP16 只慢 0.1–0.7%，EP32 只慢 0.3%。
@@ -63,13 +63,14 @@ Moonshot 在 EP32、全局 batch 512、qlen 8 上看到过 IO 突发让 EP 明�
 
 - **在 Moonshot 的配置（EP32、全局 batch 512、qlen 8）上复现了 IO 突发让 EP 变慢：decode 慢 13–28%。**
   - 条件和 EP16 一样：IO 和 EP 同在 TC 104，而且以接近线速到达 decode 的网卡。最重的是 1 台 decode 以线速读（+28%），也就是 MoRIIO 拉 KV 的方向。
-  - EP32 没有 IO 时 EP 自己就在被 ECN 标记（每台 decode 每秒 4–6 千个 CNP），再来同 TC 的突发，EP 会被进一步降速。
+  - EP32 没有 IO 时 EP 自己就在被 ECN 标记（每台 decode 每秒 4–6 千个 CNP），队列本来就有积压，再来同 TC 的突发，EP 排得更久。
 - 一个 IO 来源就足以让 EP 明显变慢（EP16 慢一半以上），不一定要 incast。前提是两个：
   - IO 和 EP 在同一个流量类；
   - IO 一次提交几 MB 以上，能以线速打进 decode 的网卡。
-- 两个集群结论不同，最可能的原因是交换机和网卡的 ECN / DCQCN 配置不同。smci355 上 EP 的发送方收到了每秒上万个 CNP。这一点是推断，还没去对比两边的配置。
+- 两个集群结论不同，原因还没查清，但不能归到“smci355 有 DCQCN、DO 没有”上：smci355 上 DCQCN 实际也没有降速（QP 默认绑在没开 DCQCN 的 profile 0）。
+  正因为发送端不限速，线速的 IO 突发能把 decode 入口的队列一直堆深，这可能就是一个来源就够的原因。两边要比较的是交换机缓冲、PFC 门限和 IO 的提交方式。
 - 建议看三件事：
-  1. 掉速时 EP 发送方（decode 网卡）收到的 CNP：`/sys/class/infiniband/ionic_*/ports/1/hw_counters/rx_rdma_cnp_pkts`；
+  1. 掉速时 EP 发送方（decode 网卡）收到的 CNP：`/sys/class/infiniband/ionic_*/ports/1/hw_counters/rx_rdma_cnp_pkts`。它表示 EP 的包在交换机里排了队，不代表一定被 DCQCN 降了速；
   2. KV 或其他 IO 和 EP 是不是同一个 TC；
   3. KV 连接器每次提交多大。
 - 缓解办法：IO 换一个流量类，EP16 和 EP32 上都能完全消除影响；把每次提交拆到 2 MB 以内，EP16 上能消除，EP32 上只能减到几个百分点；如果交换机支持，给 KV 单独配一个无损类。
@@ -133,13 +134,18 @@ base 步时约 302 ms。IO 同时打到两台 decode，每台每秒收到的量�
 - profiler 里 dispatch 的中位数从 670 µs 涨到 1,750–2,250 µs，专家计算时间不变，增加的时间都在 EP 上。
 - READ 方向的规律和写一样。
 
-## 4. 机制：ECN 标记 EP 的包，DCQCN 给 EP 降速
+## 4. 机制：EP 在同一个队列里排在 IO 后面
 
-- **decode 节点只发 EP 数据和 READ 请求。** 所以它收到 CNP，就说明它某个发送 QP 被要求降速，而这几乎只能是 EP 的 QP。
+- **decode 节点只发 EP 数据和 READ 请求。** 所以它收到 CNP，就说明它发出的 EP 包在某个交换机端口排了队、被打了 ECN 标记。
   上表里只要步时变慢，decode 就收到每秒几千到几万个 CNP；凡是没有影响的情况，CNP 都是 0。整个过程没有 PFC，也没有重传。
-- **只往一台 decode（A）写时（IWk1），另一台（B）没有收到任何 IO**，却每秒收到 6.4 万个 CNP：B 发往 A 的 EP 在 A 的入口被标记了。decode 整体慢 44%。
-- **TC 0 里既没有 ECN，也没有 CNP。** IO 和 EP 在交换机里走不同的队列，EP 的包不会被标记。
-- 这和 DO 第三轮不同：DO 上一个来源每卡 38 GB/s 只慢 1–3%。两边交换机和网卡的 ECN / DCQCN 配置可能不同，这一点还没对比。
+- **只往一台 decode（A）写时（IWk1），另一台（B）没有收到任何 IO**，却每秒收到 6.4 万个 CNP：B 发往 A 的 EP 在 A 的入口排队、被标记了。decode 整体慢 44%。
+- **TC 0 里既没有 ECN，也没有 CNP。** IO 和 EP 在交换机里走不同的队列，EP 的包不用排在 IO 后面。
+- **DCQCN 并没有真正降速，变慢来自排队本身。**
+  - smci355 的网卡默认把 QP 绑在 profile 0（`match_default` 是 0，没有 `match_rules`），这个 profile 没开 DCQCN；`nicctl show dcqcn` 里显示 “Enabled” 的是 profile 1。
+    手动把 QP 绑到 profile 1 以后，QP 状态里的 `rate_enforced`、`target_rate` 也一直是 0（另一组同事的检查）。
+  - 我们的数据也对得上：EP32 线速写进 1 台时，C 的每个 IO QP 每秒收到约 2.4 万个 CNP，平均每 42 µs 一个，IO 仍有 234 GB/s，只比 TC 0（287 GB/s，没有 CNP）低 18%。DCQCN 真在工作的话，这么密的 CNP 不到 1 毫秒就会把速率压到下限。
+  - 所以发送端不受限：一次提交 16 MB，就能把 decode 入口的队列堆到十几 MB，按 50 GB/s 算 EP 的包要多等约 300 µs；1 MB 一批最多堆 1 MB，只多等约 20 µs。单批 2–4 MB 的门槛也和这个量级对得上。
+- 这和 DO 第三轮不同：DO 上一个来源每卡 38 GB/s 只慢 1–3%。差别不能归到 DCQCN 上（smci355 实际也没有降速），要比较交换机缓冲、PFC 门限和 IO 的提交方式，这一点还没对比。
 
 ## 5. 真实 PD
 
@@ -168,7 +174,7 @@ base 步时约 302 ms。IO 同时打到两台 decode，每台每秒收到的量�
 | 无 IO | −0.1% | +15.6%（只有 1 个点） |
 
 合成负载那一列是相对自然流量拟合值的变化，拟合残差只有 1 ms。AgentX 的 batch 一直在变，按运行请求数和 KV 用量拟合后，残差仍有约 14%。
-AgentX 下 decode 收到的 CNP 和合成负载时一样多，EP 确实被降速了，但它在一步里只有几百微秒，加到步时上就很小。
+AgentX 下 decode 收到的 CNP 和合成负载时一样多，EP 的包确实在排队，但 EP 在一步里只有几百微秒，加到步时上就很小。
 
 ### 5.3 KV 放进 TC 0 会不会拖慢 KV 和 TTFT：不会
 
