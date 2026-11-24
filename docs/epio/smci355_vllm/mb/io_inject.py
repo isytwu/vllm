@@ -196,17 +196,19 @@ def _receiver(dev, args):
             return
 
 
-def sender(dev, args, out_q):
+def sender(dev, args, out_q, stop):
     die_with_parent()
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)  # the parent stops us through `stop` and waits for the records
     try:
-        _sender(dev, args, out_q)
+        _sender(dev, args, out_q, stop)
     except Exception as e:  # noqa: BLE001
         out_q.put((dev, {"error": repr(e)}))
     time.sleep(0.5)  # let the queue feeder flush
     os._exit(0)
 
 
-def _sender(dev, args, out_q):
+def _sender(dev, args, out_q, stop):
     import numpy as np
 
     import mori.io as mio
@@ -257,7 +259,7 @@ def _sender(dev, args, out_q):
     next_t = t0
     while True:
         now = time.time()
-        if now - t0 >= args.duration:
+        if now - t0 >= args.duration or stop.is_set():
             break
         if period > 0 and now < next_t:
             time.sleep(min(next_t - now, 0.0005) if next_t - now < 0.002 else next_t - now - 0.001)
@@ -283,14 +285,15 @@ def _sender(dev, args, out_q):
     send_msg(sock, "done")
     sock.close()
     t_sub, t_done, nb = np.array(t_sub), np.array(t_done), np.array(nb)
-    os.makedirs(args.out, exist_ok=True)
-    np.savez(os.path.join(args.out, f"io_dev{dev}.npz"), t_submit=t_sub, t_done=t_done, bytes=nb,
-             meta=json.dumps({"dev": dev, "args": vars(args), "host": socket.gethostname()}))
     lat = (t_done - t_sub) * 1e3
+    # the summary first: a window's end (inj_stop) SIGKILLs a few seconds after its SIGINT
     out_q.put((dev, dict(bursts=int(nb.size), gbps=float(nb.sum() / (t1 - t0) / 1e9),
                          burst_ms_p50=float(np.median(lat)) if lat.size else None,
                          burst_ms_p99=float(np.percentile(lat, 99)) if lat.size else None,
                          burst_gbps_p50=float(np.median(nb / (t_done - t_sub)) / 1e9) if lat.size else None)))
+    os.makedirs(args.out, exist_ok=True)
+    np.savez(os.path.join(args.out, f"io_dev{dev}.npz"), t_submit=t_sub, t_done=t_done, bytes=nb,
+             meta=json.dumps({"dev": dev, "args": vars(args), "host": socket.gethostname()}))
 
 
 def main():
@@ -330,7 +333,12 @@ def main():
             p.join()
         os._exit(0)
     q = ctx.Queue()
-    ps = [ctx.Process(target=sender, args=(d, args, q)) for d in devs]
+    stop = ctx.Event()
+    # SIGINT / SIGTERM (a window's end) stop the senders, which then report and write their records
+    import signal
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    ps = [ctx.Process(target=sender, args=(d, args, q, stop)) for d in devs]
     for p in ps:
         p.start()
     res = {}

@@ -15,30 +15,49 @@ source "$(dirname "$0")/../mb/lib.sh"
 : "${JOB:?}" "${C:?}" "${RUN:?}"
 DECODE=${DECODE:-$A $B}
 DN=($DECODE)
+# SOURCES: the IO sources (default C alone); the incast windows of e2e/windows.sh write one decode node from several.
+# ALLN: every node of the run once
+SOURCES=${SOURCES:-$C}
+ALLN=($(printf '%s\n' "${DN[@]}" "$C" $SOURCES | awk 'NF && !s[$0]++'))
 SPEC_K=${SPEC_K:-7}; CONC=${CONC:-128}; ISL=${ISL:-1024}; OSL=${OSL:-8000}
 WIN=${WIN:-180}; GAP=${GAP:-120}; CYCLES=${CYCLES:-2}; IOTC=${IOTC:-104}; WARM=${WARM:-300}
 OUT=$W/results/e2e/$RUN
 mkdir -p "$OUT/prof" "$OUT/load"
 exec > >(tee -a "$OUT/driver.log") 2>&1
-ctl_ips "${DN[@]}" "$C"
-echo "=== E1 $RUN job $JOB decode ${DN[*]} (DP${#DN[@]} x TP8 = EP$((8 * ${#DN[@]}))) leader ${CTL[${DN[0]}]}, IO/load C=$C (${CTL[$C]}) SPEC_K=$SPEC_K CONC=$CONC/DP ISL=$ISL OSL=$OSL targets ${TARGETS:-all} RAIL_ALIGN=${RAIL_ALIGN:-0} $(date -u +%FT%TZ)"
+ctl_ips "${ALLN[@]}"
+echo "=== E1 $RUN job $JOB decode ${DN[*]} (DP${#DN[@]} x TP8 = EP$((8 * ${#DN[@]}))) leader ${CTL[${DN[0]}]}, IO/load C=$C (${CTL[$C]}) IO sources $SOURCES SPEC_K=$SPEC_K CONC=$CONC/DP ISL=$ISL OSL=$OSL targets ${TARGETS:-all} RAIL_ALIGN=${RAIL_ALIGN:-0} $(date -u +%FT%TZ)"
 source "$W/e2e/windows.sh"
 PROF_URLS=$(for n in "${DN[@]}"; do printf '%s:8000 ' "$n"; done)
 
 PIDS=()
 cleanup() {
-    inj_stop "${DN[@]}" "$C"
+    inj_stop "${ALLN[@]}"
     for p in "${PIDS[@]}" "${INJ_PRE_PIDS[@]}"; do kill "$p" 2> /dev/null; done
     sleep 10
-    for n in "${DN[@]}" "$C"; do hx "$n" "pkill -u \$(id -u) -f '[v]llm serve|[l]oadgen.py|[V]LLM::|[i]o_inject.py'; true"; done
-    fab_stop "$OUT" "${DN[@]}" "$C"
+    for n in "${ALLN[@]}"; do hx "$n" "pkill -u \$(id -u) -f '[v]llm serve|[l]oadgen.py|[V]LLM::|[i]o_inject.py'; true"; done
+    if [ -n "${DCQCN_RULES:-}" ]; then
+        for n in "${ALLN[@]}"; do echo "$n: $(hx "$n" "bash $W/mb/dcqcn_bind.sh restore $W/logs/dcqcn_saved" 2>&1)"; done |
+            tee -a "$OUT/dcqcn_restore.log"
+    fi
+    fab_stop "$OUT" "${ALLN[@]}"
 }
 trap cleanup EXIT
-wait_idle 180 "${DN[@]}" "$C" || exit 1
-fab_start "$OUT" "${DN[@]}" "$C"
-# PRE_RECV=1: the IO windows' write receivers come up on the targets before the decode does (mb/lib.sh inj_prerecv)
+wait_idle 180 "${ALLN[@]}" || exit 1
+fab_start "$OUT" "${ALLN[@]}"
+# DCQCN_RULES="prio 0x8 1" [DCQCN_DEFAULT=1]: every port's match_rules (and match_default) for this run, so that its QPs
+# (EP, KV, IO; created from here on) get that DCQCN profile; MoRI's QPs carry SL 0, so only DCQCN_DEFAULT reaches them.
+# cleanup() puts every port back however the run ends (mb/dcqcn_bind.sh, needs sudo on the hosts)
+if [ -n "${DCQCN_RULES:-}" ]; then
+    for n in "${ALLN[@]}"; do
+        hx "$n" "bash $W/mb/dcqcn_bind.sh save $W/logs/dcqcn_saved && bash $W/mb/dcqcn_bind.sh set '$DCQCN_RULES' '${DCQCN_DEFAULT:-}'" ||
+            { echo "binding DCQCN on $n failed"; exit 1; }
+    done
+    ev dcqcn_set "$DCQCN_RULES"
+fi
+# PRE_RECV=1: the IO windows' write receivers come up on the targets before the decode does (mb/lib.sh inj_prerecv),
+# one set per IO source
 if [ -n "${PRE_RECV:-}" ]; then
-    inj_prerecv "$OUT/prerecv" "$IOTC" ${TARGETS:-$DECODE}
+    INJ_PRE_N=$(echo $SOURCES | wc -w) inj_prerecv "$OUT/prerecv" "$IOTC" ${TARGETS:-$DECODE}
     sleep 40
     ev prerecv "${TARGETS:-$DECODE}"
 fi
@@ -74,6 +93,8 @@ for try in $(seq 1 "${SERVE_TRIES:-2}"); do
     if [ -n "${PRE_RECV:-}" ]; then sleep 60; else wait_idle 300 "${DN[@]}" || exit 1; fi
 done
 ev serve_ready "$(( $(date +%s) - t0 ))s"
+# DCQCN_SHOW=1 (implied by DCQCN_RULES): which DCQCN profile the EP's QPs got, and what the firmware says about them
+[ -n "${DCQCN_RULES:-}${DCQCN_SHOW:-}" ] && dcqcn_show "$OUT/dcqcn" ready "${ALLN[@]}"
 
 [ -s "$W/logs/windows_$RUN.txt" ] && { WINDOWS=$(cat "$W/logs/windows_$RUN.txt"); WINDOWS_ADD=""; }
 nw=$(( $(echo ${WINDOWS:-base IRb IWk IRk IWb IWk10} | wc -w) + $(echo ${WINDOWS_ADD-IWk IWk10} | wc -w) ))

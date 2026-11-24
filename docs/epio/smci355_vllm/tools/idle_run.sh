@@ -9,13 +9,16 @@
 #             minutes in a row; hold it again if it has not started 3 minutes after the release
 #   running   once another job has waited for nodes for 2 minutes, empty the job's phase file: its launcher finishes
 #             the phase in progress, cleans up and cancels the job. The phases it did not reach go to a new held job
-#             (setup build warm first, same windows files), watched the same way, at most ROUNDS (3) jobs in all
+#             (PRE_PHASES first, default setup build warm; same windows and env files), watched the same way, at most
+#             ROUNDS (3) jobs in all
 # Stops when the job ends any other way, or when logs/idle_<job>.off exists (job left as it is). Log: logs/idle_run.log
 set -uo pipefail
 W=/apps/yutongwu/store-vllm/k31-vllm-ep-io-smci355-20261119
 export PATH=/opt/slurm/bin:$PATH
 JOB=${1:?held holder job}
 NEED=${NEED:-5} IDLE_MIN=${IDLE_MIN:-10} ROUNDS=${ROUNDS:-3}
+# phases a resubmitted job runs before the ones not reached (end-to-end runs need only setup)
+PRE_PHASES=${PRE_PHASES:-setup build warm}
 exec >> "$W/logs/idle_run.log" 2>&1
 log() { echo "$(date -u +%FT%TZ) [$JOB] $*"; }
 # jobs other than this one waiting for nodes (held jobs, dependencies and begin times do not count)
@@ -41,11 +44,11 @@ yield_job() {
     fi
     nj=$(cd "$W" && sbatch --parsable --hold --job-name="$NAME" --nodes="$NEED" --time=04:00:00 tools/holder.sbatch) ||
         { log "resubmitting failed"; exit 1; }
-    echo "setup build warm $left" > "$W/logs/phases_$nj.txt"
-    for f in "$W"/logs/windows_*_"$JOB".txt; do [ -e "$f" ] && cp "$f" "${f%_"$JOB".txt}_$nj.txt"; done
+    echo "$PRE_PHASES $left" > "$W/logs/phases_$nj.txt"
+    for f in "$W"/logs/windows_*_"$JOB".txt "$W"/logs/env_*_"$JOB".txt; do [ -e "$f" ] && cp "$f" "${f%_"$JOB".txt}_$nj.txt"; done
     cp "$W/tools/launch.sh" "$W/logs/run_launch_$nj.sh"
     (cd "$W" && setsid nohup bash "logs/run_launch_$nj.sh" "$nj" >> "logs/nohup_launch_$nj.out" 2>&1 < /dev/null &)
-    log "not reached goes to held job $nj: setup build warm $left"
+    log "not reached goes to held job $nj: $PRE_PHASES $left"
     JOB=$nj round=$((round + 1)) calm=0 busy=0 rel=0
     sleep 10
     lpid=$(cat "$W/logs/launch_$JOB.pid" 2> /dev/null)

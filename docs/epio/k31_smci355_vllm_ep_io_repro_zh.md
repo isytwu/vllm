@@ -8,14 +8,16 @@
 | case | 内容 | 节点 | 一次约多久 | 能否复现 IO 拖慢 EP | 预期 |
 |---|---|---|---|---|---|
 | A | **只有 decode，加注入**（EP16，每个 rank 128 条，qlen 8） | 3 | 50–60 分钟 | **能，最明显、最快** | 16 MB 一批的写或读慢约 66%，每卡 1 GB/s 也有 +15–21%；TC 0 或 1 MB 一批没有影响 |
+| A2 | **incast**：2 / 3 个来源同时打进一台 decode（EP16） | 5 | 60–70 分钟 | **能，比 A 更重** | 2:1 / 3:1 写 +88% / +131%，读 +141% / +217%；IO 走 TC 0 +0.1%。DO 上 2:1 / 3:1 只有 +15% / +39% |
 | B | **真实 PD**（MoRIIO READ）加高批量合成负载，再加注入 | 4（1P）或 5（2P） | 每段 30–50 分钟 | **注入部分能**；自然 KV 部分不能 | 注入：16 MB 一批慢 62–70%，TC 0 或 1 MB 一批没有影响，和 A 一样。自然 KV：TC 104 对 TC 0 差 ±0.6% |
 | C | 真实 PD 加 AgentX（并发 128） | 5 | 60–80 分钟 | **不能** | decode 每个 rank 只有 10–40 条在解码，EP 占比太小，自然 KV 和注入的影响都在约 14% 的噪声以内 |
 | D | 单测：只跑 mori EP 内核，加 IO | 3 | 20–50 分钟 | **能，但只在内核层面** | 大批量 READ 让 EP 内核慢 10–40 倍；KV 形状的 IO 只慢 5–20%，会低估端到端的影响 |
 | E | **EP32（Moonshot 那个 case），只有 decode，加注入**（每个 rank 128 条，全局 512，qlen 8） | 5 | 60–90 分钟 | **能** | 1 台 decode 线速读 +28%，4 台各收每股 5–10 GB/s 的突发 +25–27%，线速写进 1 台 +18%；TC 0 没有影响，拆成 1–2 MB 一批还剩 +1–7% |
-| E2 | EP32 真实 PD（MoRIIO READ）加合成负载 512 条，再加注入；AgentX | 6 | 每段 30–55 分钟 | **注入部分能**；自然 KV 不能；AgentX 那次挂死了 | 注入：1 台线速读 +25%，每股 10 GB/s +22%，TC 0 +0.3%。自然 KV：TC 104 对 TC 0 差 0.06% |
+| E2 | EP32 真实 PD（MoRIIO READ）加合成负载 512 条，再加注入；AgentX | 6 | 每段 30–55 分钟 | **注入部分能**；自然 KV 不能；AgentX 两次都挂死 | 注入：1 台线速读 +25%，每股 10 GB/s +22%，TC 0 +0.3%。自然 KV：TC 104 对 TC 0 差 0.06% |
 
 **推荐顺序：**
 1. **先跑 A。** 它能确认环境和复现都正常，之后试缓解配置也主要用它：信号大（+66%），每个窗口 3 分钟，一次作业能比较十来种配置。
+   要和 DO 的 incast 对比，或者看缓解办法在 incast 下还管不管用，用 A2（5 台）。
 2. **有效的办法再到 B 上验证。** B 走的是真实 PD 的 KV 路径，能确认这个配置对 KV 传输本身没有副作用，比如 TTFT 和吞吐。
    要确认在 Moonshot 的配置上也有效，再到 E 上跑一次（5 台，信号是 +18–28%，比 A 小）。
 3. **D 用来分析内核层面的原因。** 比如 READ 的在途量、主机内存这类端到端不好单独控制的因素。
@@ -144,6 +146,49 @@ cp tools/launch.sh logs/run_launch_$J.sh && setsid nohup bash logs/run_launch_$J
 - `results/e2e/e1_<J>/summary.md` 里是每个窗口的步时（客户端 token 间隔的中位数、p90、p99）、网卡速率，以及 profiler 里的 EP 内核时间。
 - `snaps.jsonl` 是每个窗口开始和结束时的 RDMA 计数器（CNP、ECN、重传、PFC），读法见第 F.2 节。
 - `fab_<node>.tsv` 是每秒的网卡字节、PFC、CNP 和 ECN 标记包。
+
+## A2. EP16 incast：几个来源同时打进一台 decode
+
+**用途：** 和 DO 第三轮的 incast 对比，以及看 incast 下缓解办法还管不管用。
+
+- **节点：** 5 台。前 2 台是 decode（EP16），后 3 台是 IO 来源，第一个来源同时跑负载。
+- **阶段：** `e1i`；同一个作业里要再跑几轮就用 `e1i2`、`e1i3`……，每轮有自己的 env 和 windows 文件。
+- 每个来源在目标 decode 上有自己的一组接收进程。`PRE_RECV=1` 时，它们在 decode 启动前就起好。
+
+```bash
+J=$(sbatch --parsable --nodes=5 --time=04:00:00 tools/holder.sbatch)
+echo "setup e1i" > logs/phases_$J.txt
+printf 'export RAIL_ALIGN=1\nexport PRE_RECV=1\nexport OSL=96000\n' > logs/env_e1i_$J.txt
+echo "base IWk1 IWk1x2 IWk1x3 IWk1x2p10 IWk1x2T0 IWk1x3T0 IWk1x3S IRk1x2" > logs/windows_e1i_$J.txt
+cp tools/launch.sh logs/run_launch_$J.sh && setsid nohup bash logs/run_launch_$J.sh $J >> logs/nohup_launch_$J.out 2>&1 < /dev/null &
+```
+
+要用 DO 的负载（全局 512 路在途），env 文件里再加 `export CONC=256` 和 `export SERVE_ENV="MAX_SEQS=256 MAX_BATCHED=3072"`。
+
+**窗口：**
+
+| 名字 | IO |
+|---|---|
+| `IWk1x2` `IWk1x3` | 2 / 3 个来源同时写第一台 decode，16 MB 一批，满速 |
+| 后缀 `T0` / `S` / `p<n>` | IO 在 TC 0 / 1 MB 一批 / 每股 n GB/s（`IWk1x2p10`：入口每卡 20 GB/s，线速的 40%） |
+| `IRk1x2` `IRk1x3` | 第一台 decode 同时从 2 / 3 个来源读（读的进程在窗口里新起） |
+
+**预期**（e1i_7099，base 300 ms；e1i3_7099 是 DO 的负载，结果差不多，见结论文档第 7 节）：
+
+| 窗口 | 步时变化 | 每批 16 MB 的完成时间 p50 |
+|---|---|---|
+| IWk1 | +45% | 0.41 ms |
+| IWk1x2 / IWk1x3 | +88% / +131% | 1.08 / 1.26 ms |
+| IWk1x2p10 | +66%（另一次 +86%：两个来源的突发撞不撞在一起，每次不一样） | 0.63–0.67 ms |
+| IWk1x2T0 / IWk1x3T0 | +0.1% / +0.1% | 0.70 / 1.04 ms |
+| IWk1x3S | +37% | — |
+| IRk1x2 / IRk1x3 | +141% / +217% | — |
+
+全程没有 PFC，也没有重传（TC 0 时每秒约 160 个重传）。
+
+**看结果：**
+- `python3 tools/ep32_win.py results/e2e/e1i_$J`：每个窗口的步时变化和每台节点的 CNP。
+- 每批的完成时间在 `inj_<窗口>_1/<来源>/inj/send.log` 的最后一行（每张卡的 `burst_ms_p50` / `burst_ms_p99`）。
 
 ## B. EP16 真实 PD 加高批量合成负载，再加注入
 
@@ -288,6 +333,9 @@ python3 tools/ep32_win.py results/e2e/e1m_$J    # 每个窗口：IO 开着对前
   `kill $(pgrep -f "e2e/.snap_${J}_e1m_e1.sh" | head -1)`（启动器跑的是 `e1.sh` 的快照）。
 - 每轮 profiler 的 trace 有约 2 GB，`e1_analyze.py` 已经改成并行解析，约 20 秒。
 
+**EP32 的 incast（6 台）：** 阶段 `e1mi`，前 4 台 decode，后 2 台 IO 来源，窗口同 case A2（`IWk1x2`、`IWk1x2T0`、`IWk1x2S`、`IRk1x2` 等），env 同上。
+预期（e1mi_7100，base 527 ms）：2:1 写 +30%，2:1 读 +56%，2:1 写在 TC 0 +0.1%，2:1 写拆成 1 MB 一批 +8%。
+
 ## E2. EP32 真实 PD
 
 **用途：** 在 Moonshot 的配置上走真实的 PD KV 路径，看自然 KV 和注入 IO 的影响。
@@ -309,7 +357,7 @@ cp tools/launch.sh logs/run_launch_$J.sh && setsid nohup bash logs/run_launch_$J
 **预期**（pd32_7006、pd32t0_7006）：
 - 自然 KV：KV 平均 3.6 GB/s、p99 9 GB/s，TC 104 和 TC 0 的步时是 545.3 对 545.0 ms，看不出影响。
 - 注入：IRk1 +25%，IWk10 +22%，IWk1 +17%，IWk1g +10%，IWkS +2%，IWk1T0 +0.3%，比只有 decode（case E）低 1.5–3 个百分点。
-- `pd32a`（AgentX）在 7006 上预热 3 分钟后 decode 挂死，没有数据，见“坑”第 11 条。
+- `pd32a`（AgentX）在 7006、7101 上两次都在预热 1–3 分钟后 decode 挂死，没有数据，见“坑”第 11 条。
 
 **看结果：**
 
@@ -350,7 +398,7 @@ for i in 0 1 2 3 4 5 6 7; do cat /sys/class/infiniband/ionic_$i/ports/1/hw_count
 | EP 负载 | 每个 rank 的序列数（`MAX_SEQS`，`CONC`）；投机草稿 token 数（`SPEC_K`，qlen = `SPEC_K` + 1） |
 | EP 内核 | `serve.sh` 的 `A2A`（`--all2all-backend`，默认 `mori_low_latency`） |
 | rail 对齐 | `RAIL_ALIGN=1`，见 `mb/rail.sh` |
-| 网卡的 DCQCN | 不在工具包里，要 root。smci355 的 QP 默认绑在 profile 0（`match_default` 0），没开 DCQCN；可以用 `nicctl` 把 QP 绑到开了 DCQCN 的 profile（`match_default` 或 `match_rules`）。另一组同事绑过，QP 状态里的 `rate_enforced`、`target_rate` 仍是 0，固件到底有没有限速要找 AINIC 确认。DCQCN 真正生效后，IO 会被限速、队列变浅，有可能就是一种缓解办法，值得用 case A 测 |
+| 网卡的 DCQCN | `e2e/e1.sh` 的 `DCQCN_RULES="prio 0x8 1"` 加 `DCQCN_DEFAULT=1`（`mb/dcqcn_bind.sh`，要节点上的 sudo；跑完自动恢复，结束时核对）。默认 QP 在 profile 0，没开 DCQCN；只设规则绑不上 MoRI 的 QP（见“坑”第 13 条）。实测（作业 7099，case A2）：绑上 profile 1 以后固件不限速，结果和不绑一样，在这版固件上不是缓解办法；要不要找 AINIC 确认由你们定 |
 | 交换机的缓冲、ECN 和 PFC 门限 | 不在工具包里。smci355 上一个来源就能让 EP 排队，DO 上不会，两边的差别最可能在这里，或者在 IO 的提交方式上 |
 
 ## G. 踩过的坑
@@ -367,6 +415,8 @@ for i in 0 1 2 3 4 5 6 7; do cat /sys/class/infiniband/ionic_$i/ports/1/hw_count
 10. **AgentX 跑的时间长，又会占满 prefill。** 测注入时，用合成负载（case A、B）更干净。
 11. **EP32 挂死过一次，就在注入脚本往 decode 上起 io_inject 接收进程之后几秒。** 当时 C 还没开始发 IO，所有 rank 停在 EP 内核里，没有恢复。
     之后用 `PRE_RECV=1` 把写入的接收进程提前到 decode 启动前，没再挂。运行中新起进程（`IWk0`、每次 `IRk1`）也没再复现，触发条件没确认。读类窗口（`IRk*`）的发起端还是在窗口里新起，建议排在后面。
-    EP32 真实 PD 加 AgentX（`pd32a`）也挂过一次：预热 3 分钟后所有 rank 停住，10 分钟后 RCCL watchdog 杀掉进程。那台 decode 有进程到作业结束都没杀掉，节点被 Slurm 置成 drain（`Kill task failed`），要管理员 resume。
+    **EP32 真实 PD 加 AgentX（`pd32a`）两次都挂了**（7006、7101）：预热 1–3 分钟后所有 rank 停住，10 分钟后 RCCL watchdog 杀掉进程。第一次那台 decode 有进程到作业结束都没杀掉，节点被 Slurm 置成 drain（`Kill task failed`），要管理员 resume。
     挂死时 `load/live.jsonl` 里 `open` 不变、`gaps` 一直是 0，可以早点结束运行，不用等 watchdog。
 12. **EP32 用默认的 8k 输出，后段的比较会被 prefill 干扰。** 见 case E，用 `OSL=64000`。看 p90 时尤其要注意：后段有请求结束以后，没有 IO 的 p90 也会涨到约 720 ms。
+13. **绑 DCQCN profile 要用 `match_default 1`。** `match_rules "prio 0x8 1"` 只认 SL 3 的 QP，MoRI 只设流量类、SL 是 0，所以 EP 和 IO 的 QP 都还在 profile 0（e1i2_7099 就是这样白跑的）。绑没绑上，看运行目录 `dcqcn/ready_<node>.txt` 里 QP 的 `dcqcn_profile`。
+14. **注入工具的每批耗时：** 窗口结束时发送端收到 SIGINT，会先报出每张卡的 `burst_ms_p50` / `burst_ms_p99` 和吞吐，再写原始记录；`inj_stop` 在 SIGINT 后等 8 秒才强杀。改过之前（作业 7099 之前）的运行没有这项数据。

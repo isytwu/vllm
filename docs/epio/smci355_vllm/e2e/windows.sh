@@ -25,6 +25,10 @@
 #   IWk0    io_inject's receivers set up on the targets (GPU buffers registered, CQs polled), one 16 MB burst per
 #           rail, then nothing: the receivers without the traffic
 #   IWkN1   IWk with the receivers moved to socket 1 (taskset -c 64-127), away from the vLLM workers
+#   IWk1x2 / IWk1x3        incast: the first 2 / 3 IO sources (C, then SOURCES) write the first target at once, back to
+#                          back; suffix T0 = in TC 0, S = in 1 MB batches, p<n> = each flow at <n> GB/s per NIC
+#                          (IWk1x2p10: 20 GB/s into each of the target's NICs, 40 % of line rate)
+#   IRk1x2 / IRk1x3        the same with the first target reading the 2 / 3 sources at once
 # logs/windows_<run>.txt (e.g. windows_e1m_6855.txt), when it exists, replaces WINDOWS (and WINDOWS_ADD) for that run.
 #   IRb / IWb    mori's IO benchmark (8 GPU pairs, 32 KB transfers, batches of 8192) between C and every target: the
 #                targets read C (IRb) or C writes them (IWb). In the microbenchmarks IRb's pattern (thousands of small
@@ -50,8 +54,10 @@ profile() {
     ev "prof_$1" end
 }
 
-win_rates() { local n s=""; for n in $DECODE "$C"; do s="$s$n $(rate "$n" 2) | "; done; echo "$s"; }
-snaps() { local n; for n in $DECODE "$C"; do hx "$n" "bash $W/mb/snap.sh $1" >> "$OUT/snaps.jsonl" 2> /dev/null; done; }
+# io_nodes: C and the other IO sources (SOURCES, e2e/e1.sh), each once, C first
+io_nodes() { printf '%s\n' "$C" ${SOURCES:-} | awk 'NF && !s[$0]++'; }
+win_rates() { local n s=""; for n in $DECODE $(io_nodes); do s="$s$n $(rate "$n" 2) | "; done; echo "$s"; }
+snaps() { local n; for n in $DECODE $(io_nodes); do hx "$n" "bash $W/mb/snap.sh $1" >> "$OUT/snaps.jsonl" 2> /dev/null; done; }
 
 # alive: the decode streamed something in the last minute (the loadgen's 10 s records); a hung decode (e1_6857 IWb,
 # e1x_6857 ramp-up) ends the run instead of idling through the remaining windows
@@ -62,10 +68,19 @@ alive() {
 }
 
 window() {
-    local name=$1 cyc=$2 per=0 mb=16 inf=1 tc=$IOTC t tg=(${TARGETS:-$DECODE})
+    local name=$1 cyc=$2 per=0 mb=16 inf=1 tc=$IOTC t i tg=(${TARGETS:-$DECODE}) srcs=($(io_nodes)) k=0 mod=""
     alive || { ev stalled "no streamed chunks in the last minute before $name"; exit 3; }
+    # IWk1x<k>[T0|S|p<GB/s>]: k IO sources write the first target at once (k:1 incast), back to back / in TC 0 / in 1 MB
+    # batches / each flow at <GB/s>; IRk1x<k>[...]: the first target reads the k sources at once instead
+    if [[ $name =~ ^I[WR]k1x([2-9])(T0|S|p[0-9]+)?$ ]]; then
+        k=${BASH_REMATCH[1]} mod=${BASH_REMATCH[2]}
+        (( k <= ${#srcs[@]} )) || { ev "$name" "skipped: $k IO sources wanted, ${#srcs[@]} given"; return 0; }
+    fi
     ev "$name" start
     case "$name" in
+        I[WR]k1x[2-9]*)
+            tg=("${tg[0]}")
+            case $mod in T0) tc=0 ;; S) mb=1 ;; p*) per=$(awk -v r="${mod#p}" 'BEGIN { printf "%g", 16 / r }') ;; esac ;;
         IWk1T0) tc=0 tg=("${tg[0]}") ;;
         IWk1S) mb=1 tg=("${tg[0]}") ;;
         IWk1p20) per=0.8 tg=("${tg[0]}") ;;
@@ -92,6 +107,16 @@ window() {
         IWk1|IRk1|IRb1|IWb1) tg=("${tg[0]}") ;;
     esac
     case "$name" in
+        IWk1x[2-9]*)
+            # source i into the target's receivers of port block i (PRE_RECV) or into fresh ones
+            for i in $(seq 0 $((k - 1))); do
+                INJ_SRC_IDX=$i inj_start "$OUT/inj_${name}_$cyc/${srcs[$i]}" "$tc" write "${srcs[$i]}" "${tg[0]}" --chunk-mb $mb --period-ms $per --inflight $inf --duration $((WIN + 120))
+            done ;;
+        IRk1x[2-9]*)
+            # one reader on the target per source; the readers come up mid-run (fresh processes on the decode node)
+            for i in $(seq 0 $((k - 1))); do
+                inj_start "$OUT/inj_${name}_$cyc/${srcs[$i]}" "$tc" read "${tg[0]}" "${srcs[$i]}" --chunk-mb $mb --period-ms $per --inflight $inf --duration $((WIN + 120))
+            done ;;
         IWk|IWk10|IWkT0|IWk1|IWk1T0|IWk1S|IWk1p20|IWk1p10|IWk1p5|IWk1p2|IWk5|IWk2|IWk1g|IWk1gS|IWk1gB|IWk10S|IWk5S|IWkS|IWk10c2|IWk10c4|IWk10c8|IWkSi4|IWkSi16|IWkR16|IWkR64)
             for t in "${tg[@]}"; do
                 inj_start "$OUT/inj_${name}_$cyc/$t" "$tc" write "$C" "$t" --chunk-mb $mb --period-ms $per --inflight $inf --duration $((WIN + 120))
@@ -130,12 +155,14 @@ window() {
             sleep 25 ;;
     esac
     [ "$name" = base ] || { sleep 20; ev "${name}_io_on" "$(win_rates)"; }
+    # the IO's QPs exist now: their DCQCN profile and state, next to the EP's
+    case "$name" in IWk | IWk1 | IWk1x3) [ -n "${DCQCN_RULES:-}${DCQCN_SHOW:-}" ] && dcqcn_show "$OUT/dcqcn" "${name}_$cyc" $DECODE $(io_nodes) ;; esac
     snaps "${name}_${cyc}_a"
     sleep $((WIN / 2 - 20))
     profile "${name}_$cyc"
     sleep $((WIN / 2 - 20))
     snaps "${name}_${cyc}_b"
-    [ "$name" = base ] || { ev "${name}_io_end" "$(win_rates)"; inj_stop $DECODE "$C"; iob_stop $DECODE "$C"; }
+    [ "$name" = base ] || { ev "${name}_io_end" "$(win_rates)"; inj_stop $DECODE $(io_nodes); iob_stop $DECODE "$C"; }
     ev "$name" end
     tail -1 "$OUT/load/live.jsonl" 2> /dev/null
 }

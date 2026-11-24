@@ -38,6 +38,10 @@
 #   pd32a   EP32 P/D under AgentX (concurrency 256), natural traffic only: 2 prefill + 4 decode, the proxy and the
 #           client on the first prefill node
 #   e1x     e1 at twice the EP load (256 sequences per DP rank), windows base IRb IRb1 IWb IRk
+#   e1i     incast (5-node jobs): EP16 decode on the first two nodes, three IO sources (C first) writing the first decode
+#           node from 1 / 2 / 3 of them at once (IWk1, IWk1x2, IWk1x3, with TC 0 variants); e1i2, e1i3 more such runs
+#   e1mi    incast against the Moonshot case (6-node jobs): EP32 decode on the first four nodes, two IO sources
+#           (IWk1x2, IRk1x2, ...); e1mi2 a second such run
 #   e1t1    the same with the IO on one decode node only (IWk1 / IRk1 / IWhR windows)
 #   e2w/e2r     vLLM K3.1 PD through srtctl, EP16 decode (3-node jobs), MoRIIO WRITE / READ, IO windows (e2e/e2.sh)
 #   e2w32/e2r32 the same with the EP32 decode (5-node jobs)
@@ -216,6 +220,21 @@ while next_phase; do
         WIN=${E1_WIN:-120} GAP=${E1_GAP:-60} CYCLES=${E1_CYCLES:-1} RUN=${ph}_$JOB DECODE="$EPN" \
             WINDOWS="base IWk IWk1 IRb IRb1 IRk IWk10 IWb" WINDOWS_ADD="" \
             phase "$ph" 2400 $(( $(left_s) - 300 )) bash "$(snap "$W/e2e/e1.sh" "$ph")"; e2esum "${ph}_$JOB" ;;
+    e1i*)
+        # incast on a 5-node job: the EP16 decode (DP2 x 128 sequences) on the first two nodes, three IO sources on the
+        # other three (the first of them, C, also runs the load); windows IWk1x2 / IWk1x3 write the first decode node from
+        # 2 / 3 of them at once. e1i2, e1i3, ...: more such runs (each with its own windows / env file, e.g. DCQCN_RULES)
+        (( NN >= 5 )) || { echo "skip $ph: needs 5 nodes"; continue; }
+        WIN=${E1_WIN:-120} GAP=${E1_GAP:-60} CYCLES=${E1_CYCLES:-1} RUN=${ph}_$JOB DECODE="${NODES[0]} ${NODES[1]}" \
+            C="${NODES[2]}" SOURCES="${NODES[*]:2:3}" WINDOWS="base IWk1 IWk1x2 IWk1x3 IWk1x2T0 IWk1x3T0" WINDOWS_ADD="" \
+            phase "$ph" 2400 $(( $(left_s) - 300 )) bash "$(snap "$W/e2e/e1.sh" "$ph")"; e2esum "${ph}_$JOB" ;;
+    e1mi*)
+        # incast against the Moonshot case on a 6-node job: the EP32 decode (DP4 x 128 sequences, global batch 512 at
+        # qlen 8) on the first four nodes, two IO sources on the other two (the first, C, also runs the load)
+        (( NN >= 6 )) || { echo "skip $ph: needs 6 nodes"; continue; }
+        WIN=${E1_WIN:-120} GAP=${E1_GAP:-60} CYCLES=${E1_CYCLES:-1} RUN=${ph}_$JOB DECODE="${NODES[*]:0:4}" \
+            C="${NODES[4]}" SOURCES="${NODES[*]:4:2}" WINDOWS="base IWk1 IWk1x2 IWk1x2T0 IRk1x2" WINDOWS_ADD="" \
+            phase "$ph" 2400 $(( $(left_s) - 300 )) bash "$(snap "$W/e2e/e1.sh" "$ph")"; e2esum "${ph}_$JOB" ;;
     e1x)
         # twice the EP load: 256 sequences per DP rank (256 tokens per EP rank per dispatch at qlen 8)
         WIN=${E1_WIN:-120} GAP=${E1_GAP:-60} CYCLES=${E1_CYCLES:-1} RUN=e1x_$JOB DECODE="$EPN" CONC=256 \
@@ -224,9 +243,10 @@ while next_phase; do
     e1t1)
         WIN=${E1_WIN:-120} GAP=${E1_GAP:-60} CYCLES=${E1_CYCLES:-1} RUN=e1t1_$JOB DECODE="$EPN" TARGETS="$B" WINDOWS="base IWk1 IRk1 IWhR" \
             phase e1t1 2400 $(( $(left_s) - 300 )) bash "$(snap "$W/e2e/e1.sh" "$ph")"; e2esum "e1t1_$JOB" ;;
-    pd32a)
+    pd32a*)
         # EP32 P/D under AgentX, natural traffic only: two prefill nodes, the EP32 decode on the next four, no IO node
-        # (the proxy and the AgentX client run on the first prefill node, on its CPUs)
+        # (the proxy and the AgentX client run on the first prefill node, on its CPUs). pd32aL, pd32aLt0, ...: the same
+        # layout with its env file changing the client or the KV's TC (e.g. CLIENT=loadgen ISL=32768 for long prompts)
         (( NN >= 6 )) || { echo "skip $ph: needs 6 nodes"; continue; }
         PREFILL="${NODES[0]} ${NODES[1]}" DECODE="${NODES[*]:2:4}" C="${NODES[0]}" RUN=${ph}_$JOB KVTC=104 DUR=1500 \
             NAT_S=1500 WINDOWS=none WINDOWS_ADD="" RAIL_ALIGN=1 CONC=${PD32A_CONC:-256} CLIENT=agentx \
@@ -266,6 +286,8 @@ done
 rm -f "$LOCK"
 # a launcher that found no phase left ran none: whoever popped them is still running them
 [ "$RAN" = 1 ] || { echo "no phases left for job $JOB; leaving it alone ($(date -u +%FT%TZ))"; exit 0; }
+# a run with DCQCN_RULES puts the ports back itself; this catches one that could not (no-op where nothing is saved)
+for n in "${NODES[@]}"; do echo "  $n dcqcn: $(hx "$n" "bash $W/mb/dcqcn_bind.sh restore $W/logs/dcqcn_saved" 2>&1)"; done
 sweep "${NODES[@]}"
 echo "done; cancelling $JOB ($(date -u +%FT%TZ))"
 scancel "$JOB"
