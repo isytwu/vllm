@@ -356,7 +356,7 @@ cp tools/launch.sh logs/run_launch_$J.sh && setsid nohup bash logs/run_launch_$J
 ```
 
 **预期**（pd32_7006、pd32t0_7006）：
-- 自然 KV：KV 平均 3.6 GB/s、p99 9 GB/s，TC 104 和 TC 0 的步时是 545.3 对 545.0 ms，看不出影响。
+- 自然 KV：KV 平均 3.6 GB/s、p99 9 GB/s（4 台 decode 合计），TC 104 和 TC 0 的步时是 545.3 对 545.0 ms，看不出影响。
 - 注入：IRk1 +25%，IWk10 +22%，IWk1 +17%，IWk1g +10%，IWkS +2%，IWk1T0 +0.3%，比只有 decode（case E）低 1.5–3 个百分点。
 - `pd32a`（AgentX）在 7006、7101 上两次都在预热 1–3 分钟后 decode 挂死，没有数据，见“坑”第 11 条。
 

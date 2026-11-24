@@ -47,7 +47,7 @@ Moonshot 在 EP32、全局 batch 512、qlen 8 上看到过 IO 突发让 EP 明�
    - 配置：MoRIIO READ 模式。负载分别是 AgentX 回放 Claude Code 轨迹（并发 128），以及每个 rank 128 条的合成负载。
    - KV 和 EP 同在 TC 104 时，与 KV 放进 TC 0 相比，每步差别在 ±0.5% 以内。
    - 真实 KV 只有 0.8–3.1 GB/s（两台 decode 合计），EP 每秒只收到 2–20 个 CNP（第 5 节）。
-   - EP32 上也一样：512 条合成负载，KV 平均 3.6 GB/s、p99 9 GB/s，TC 104 和 TC 0 的步时是 545.3 对 545.0 ms（第 6.4 节）。
+   - EP32 上也一样：512 条合成负载，KV 平均 3.6 GB/s、p99 9 GB/s（4 台 decode 合计），TC 104 和 TC 0 的步时是 545.3 对 545.0 ms（第 6.4 节）。
 7. **在真实 PD 上注入 IO，影响取决于 EP 负载。**
    - 每个 rank 128 条序列时，和只有 decode 时一样：16 MB 一批慢 62–70%，1 MB 一批或 TC 0 没有影响。
      EP32 也一样：1 台 decode 线速读 +25%，每股 10 GB/s 写 +22%，线速写进 1 台 +17%，TC 0 +0.3%。
@@ -122,35 +122,35 @@ EP16 是两台 decode（DP2 × TP8）。每个 rank 128 条序列、qlen 8 时�
 
 ### 2.1 流量的量级：EP、KV 和注入的 IO
 
-线速：每张网卡 400 Gb/s，约 50 GB/s；每台 8 张，约 400 GB/s。smci355 的数字都是每秒的网卡计数（1 秒粒度）。
-EP 取 decode 的发送速率（decode 只发 EP 和很小的 READ 请求）；KV 取所有 decode 的“收减发”之和（EP 在 decode 之间互发，合起来抵消），和 prefill 的发送速率对得上。
+线速：每张网卡 400 Gb/s，约 50 GB/s；每台 8 张，约 400 GB/s。**除了“每股”（一对网卡），本节的速率都是每台机器 8 张网卡加起来的量**，括号里是平均每张网卡（8 张网卡的流量基本一样，两边的数字都这样换算）。smci355 的数字来自每秒一次的网卡计数（1 秒粒度）。
+EP 取每台 decode 的发送速率（decode 只发 EP 和很小的 READ 请求）。KV 取每台 decode 的“收减发”：EP 在 decode 之间对称互发，收发抵消；同一台的收和发是同一次采样，不受各台采样时刻错开的影响。各台 decode 的 KV 加起来，和 prefill 的发送速率对得上。
 
-**自然流量和合成负载下的 EP、KV：**
+**自然流量和合成负载下的 EP、KV（范围是各台 decode 之间的差别）：**
 
-| 场景 | EP（每台 decode 发出） | KV 流入（所有 decode 合计）平均 / 1 秒 p99 / 最大 |
+| 场景 | EP：每台 decode 发出（每张网卡） | KV：流入每台 decode，平均 / 1 秒 p99 / 最大 |
 |---|---|---|
-| smci355 EP16，AgentX 并发 128（pd_6954） | 15.7 GB/s | 2.6 / 14.9 / 34 GB/s |
-| smci355 EP16，合成 2k / 2k，每个 rank 128 条（pdh_6977） | 35.7 GB/s | 0.8 / 3.0 / 5.2 GB/s |
-| smci355 EP16，合成 1k / 512，新请求多 4 倍（pdhf_6977） | 35.0 GB/s | 3.1 / 8.5 / 9.5 GB/s |
-| smci355 EP16，合成 8k / 2k，2 台 prefill（pdh_6976） | 36.4 GB/s | 1.0 / 3.3 / 5.8 GB/s |
-| smci355 EP32，合成 2k / 512，全局 512（pd32_7006） | 60.1 GB/s | 3.6 / 7.6 / 11.2 GB/s |
-| smci355 只有 decode：EP16 每个 rank 128 / 256 条（e1i / e1i3）；EP32（e1mi） | 35.6 / 38.9 GB/s；61.0 GB/s | — |
-| DO 的 SGLang，EP16，AgentX 并发 256（[第一轮](https://github.com/isytwu/sglang/blob/k31-epio-probe-opt4/docs/epio/k31_agentx_ep_kv_umbp_zh.md)） | 约 2.4 GB/s（每个方向） | 每台 1.9–2.3 GB/s；100 ms 粒度 p99 38–56、最大 243 GB/s |
-| DO 的 SGLang，EP16，合成 512 路在途（[第三轮](https://github.com/isytwu/sglang/blob/k31-epio-probe-opt4/docs/epio/k31_ep512_io_zh.md)） | 约 11 GB/s（收发合计 12，其中 KV 约 1） | 约 1 GB/s |
+| smci355 EP16，AgentX 并发 128（pd_6954） | 15.7 GB/s（2.0） | 1.3 / 8–10 / 11–26 GB/s |
+| smci355 EP16，合成 2k / 2k，每个 rank 128 条（pdh_6977） | 35.8 GB/s（4.5） | 0.4 / 2.0–2.4 / 3.1–3.3 GB/s |
+| smci355 EP16，合成 1k / 512，新请求多 4 倍（pdhf_6977） | 35.0 GB/s（4.4） | 1.5 / 5.5–6.3 / 6.7–7.6 GB/s |
+| smci355 EP16，合成 8k / 2k，2 台 prefill（pdh_6976） | 36.4 GB/s（4.6） | 0.5 / 1.7–2.8 / 2.3–5.5 GB/s |
+| smci355 EP32，合成 2k / 512，全局 512（pd32_7006） | 60.1 GB/s（7.5） | 0.9 / 2.7–5.0 / 4.0–6.8 GB/s |
+| smci355 只有 decode：EP16 每个 rank 128 / 256 条（e1i / e1i3）；EP32（e1mi） | 35.6 / 38.9 GB/s（4.5 / 4.9）；61.0 GB/s（7.6） | — |
+| DO 的 SGLang，EP16，AgentX 并发 256（[第一轮](https://github.com/isytwu/sglang/blob/k31-epio-probe-opt4/docs/epio/k31_agentx_ep_kv_umbp_zh.md)） | 约 2.4 GB/s（0.3） | 1.9–2.3 GB/s；100 ms 粒度 p99 38–56、最大 157–243 GB/s |
+| DO 的 SGLang，EP16，合成 512 路在途（[第三轮](https://github.com/isytwu/sglang/blob/k31-epio-probe-opt4/docs/epio/k31_ep512_io_zh.md)） | 约 10.7 GB/s（1.3；decode 入口共 11.6，其余是 KV） | 约 1 GB/s（短请求）到约 5 GB/s（2 台 prefill、多轮长上下文） |
 
-- **EP：** smci355 上 vLLM 的 EP 是 DO 上 SGLang 的 3–15 倍。同样是 AgentX，smci355 并发 128 时每台 15.7 GB/s，DO 并发 256 时约 2.4 GB/s；合成负载是 35–39 对约 11 GB/s。大头是 vLLM 的 K3.1 没有做 sequence-parallel MoE（第 1 节）。但即使是 EP32 的 60 GB/s，平均也只占每张网卡的 15%。
-- **KV：** 两边都只有平均几 GB/s。KV 是按请求成批到达的突发，粒度越细峰值越高：DO 用 100 ms 粒度测到 p99 38–56 GB/s，smci355 用 1 秒粒度只有 3–15 GB/s。下面 IWkR16 / IWkR64 两档，就是在模拟这种“每秒到一批”的线速突发。
+- **EP：** 同样是 AgentX，smci355 并发 128 时每台 15.7 GB/s，DO 并发 256 时约 2.4 GB/s，是 6.5 倍；合成负载是 35–39 对约 10.7 GB/s，3.3–3.6 倍。按每步每台搬的字节算，同样 512 路在途是 21.4 对约 2.6 GB（8 倍，第 1 节）。大头是 vLLM 的 K3.1 没有做 sequence-parallel MoE。即使是 EP32 的每台 60 GB/s，也只是每张网卡 7.5 GB/s，线速的 15%。
+- **KV：** 两边每台平均都只有几 GB/s：smci355 0.4–1.5 GB/s，DO 1–5 GB/s。KV 是按请求成批到达的突发，粒度越细峰值越高：DO 用 100 ms 粒度测到每台 p99 38–56 GB/s，smci355 用 1 秒粒度每台 p99 只有 2–10 GB/s。下面 IWkR16 / IWkR64 两档，就是在模拟这种“每秒到一批”的线速突发。
 
-**注入的档位：** 16 MB 一批（除非注明），每股是 C 的一张网卡对 decode 的一张网卡（同一条 rail）。下表是 IO 本身打进每台 decode 的量，不含 EP。
+**注入的档位：** 16 MB 一批（除非注明）。“每股”是 C 的一张网卡对 decode 的一张网卡（同一条 rail），是单张网卡的速率；表里其余的数是 IO 本身打进每台 decode 的量（8 张网卡合计，不含 EP），括号里是平均每张网卡。
 
 | 窗口 | 设置 | EP16（2 台 decode） | EP32（4 台 decode） | 占每台 decode 线速 |
 |---|---|---|---|---|
-| IWkR16 / IWkR64 | 每张网卡每秒一次 16 / 64 MB | 0.13 / 0.51 GB/s | 同左 | 0.1% |
-| IWk1g / IWk2 / IWk5 / IWk10 | 每股 1 / 2 / 5 / 10 GB/s | 8.4 / — / — / — GB/s | 8.4 / 16.8 / 41.9 / 83.7 GB/s | 2% / 4% / 10% / 21% |
-| IWk | 连续满速，C 的每张网卡分给各台 decode | 186 GB/s（每股约 23 GB/s） | 95 GB/s（每股约 12 GB/s） | 47% / 24% |
-| IWkS | 1 MB 一批，连续 | 134 GB/s | 86 GB/s | 34% / 22% |
-| IWk1 / IRk1 | 只打第一台 decode，C 的 8 张网卡都给它 | 284 GB/s | 234 GB/s | 71% / 58% |
-| IWk1x2 / IWk1x3 | 2 / 3 个来源同时写一台（incast） | 261 / 319 GB/s | 2:1 时 242 GB/s（两个来源 136 + 106） | 65% / 80%；60% |
+| IWkR16 / IWkR64 | 每张网卡每秒一次 16 / 64 MB | 0.13 / 0.51 GB/s（0.016 / 0.064） | 同左 | 0.1% |
+| IWk1g / IWk2 / IWk5 / IWk10 | 每股 1 / 2 / 5 / 10 GB/s | 8.4 / 16.8 / 42 / 84 GB/s（1.0 / 2.1 / 5.3 / 10.5） | 同左 | 2% / 4% / 10% / 21% |
+| IWk | 连续满速，C 的每张网卡分给各台 decode | 186 GB/s（23） | 95 GB/s（12） | 47% / 24% |
+| IWkS | 1 MB 一批，连续 | 134 GB/s（17） | 86 GB/s（11） | 34% / 22% |
+| IWk1 / IRk1 | 只打第一台 decode，C 的 8 张网卡都给它 | 284 GB/s（36） | 234 GB/s（29） | 71% / 58% |
+| IWk1x2 / IWk1x3 | 2 / 3 个来源同时写一台（incast） | 261 / 319 GB/s（33 / 40） | 2:1 时 242 GB/s（30；两个来源 136 + 106） | 65% / 80%；60% |
 | 单批大小 | 每股 10 GB/s 时 1 / 2 / 4 / 8 / 16 MB 一批；每股 1 GB/s 时 1 / 16 / 64 MB 一批 | | | |
 | `T0` 后缀 | 同一档，IO 在 TC 0 | | | |
 
@@ -158,7 +158,7 @@ EP 取 decode 的发送速率（decode 只发 EP 和很小的 READ 请求）；K
 
 ## 3. 只有 decode：IO 的速率、单批大小、流量类
 
-base 步时约 302 ms。IO 同时打到两台 decode，每台每秒收到的量里含 EP 自身的约 35 GB/s。
+base 步时约 302 ms。IO 同时打到两台 decode，“每台 decode 收到”是 8 张网卡合计，含 EP 自身的约 35 GB/s（只算 IO 的量见第 2.1 节）。
 
 | 窗口 | IO | 每台 decode 收到 | 步时变化 | decode 收到的 CNP（每秒） |
 |---|---|---|---|---|
