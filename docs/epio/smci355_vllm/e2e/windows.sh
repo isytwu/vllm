@@ -20,6 +20,8 @@
 #   IRkS / IRk10S          the reads in 1 MB bursts back to back / at 10 GB/s per NIC
 #   IWkR16 / IWkR64        one 16 / 64 MB burst per NIC per second: roughly a 4k / 16k-token prompt's KV (576 B per
 #                          token and layer, DCP 8 spreads it over the DP rank's 8 GPUs) landing once a second
+#   IWkP<ms>               one 16 MB burst per NIC every <ms> ms into every target (16 / <ms> GB/s per NIC; IWk1g is
+#                          IWkP16, IWkR16 IWkP1000): where between those two 16 MB bursts start to cost
 #   SPIN    no IO: 8 busy loops on each target in a job step, i.e. on the CPUs io_inject's processes get (each of
 #           them spins a core polling its CQs; the vLLM workers are pinned to the same socket)
 #   IWk0    io_inject's receivers set up on the targets (GPU buffers registered, CQs polled), one 16 MB burst per
@@ -103,6 +105,7 @@ window() {
         IWkSi16) mb=1 inf=16 ;;
         IWkR16) per=1000 mb=16 ;;
         IWkR64) per=1000 mb=64 ;;
+        IWkP[0-9]*) per=${name#IWkP} ;;
         IWkT0|IRkT0) tc=0 ;;
         IWk1|IRk1|IRb1|IWb1) tg=("${tg[0]}") ;;
     esac
@@ -117,7 +120,7 @@ window() {
             for i in $(seq 0 $((k - 1))); do
                 inj_start "$OUT/inj_${name}_$cyc/${srcs[$i]}" "$tc" read "${tg[0]}" "${srcs[$i]}" --chunk-mb $mb --period-ms $per --inflight $inf --duration $((WIN + 120))
             done ;;
-        IWk|IWk10|IWkT0|IWk1|IWk1T0|IWk1S|IWk1p20|IWk1p10|IWk1p5|IWk1p2|IWk5|IWk2|IWk1g|IWk1gS|IWk1gB|IWk10S|IWk5S|IWkS|IWk10c2|IWk10c4|IWk10c8|IWkSi4|IWkSi16|IWkR16|IWkR64)
+        IWk|IWk10|IWkT0|IWk1|IWk1T0|IWk1S|IWk1p20|IWk1p10|IWk1p5|IWk1p2|IWk5|IWk2|IWk1g|IWk1gS|IWk1gB|IWk10S|IWk5S|IWkS|IWk10c2|IWk10c4|IWk10c8|IWkSi4|IWkSi16|IWkR16|IWkR64|IWkP[0-9]*)
             for t in "${tg[@]}"; do
                 inj_start "$OUT/inj_${name}_$cyc/$t" "$tc" write "$C" "$t" --chunk-mb $mb --period-ms $per --inflight $inf --duration $((WIN + 120))
             done ;;

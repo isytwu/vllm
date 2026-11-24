@@ -125,6 +125,7 @@ cp tools/launch.sh logs/run_launch_$J.sh && setsid nohup bash logs/run_launch_$J
 | `IWkSi4` `IWkSi16` | 1 MB 一批，同时 4 / 16 批在途 |
 | `IWk1gB` | 每卡 1 GB/s，64 MB 一批 |
 | `IWkR16` `IWkR64` | 每张网卡每秒一次 16 / 64 MB 的突发（模拟每秒到一个请求的 KV） |
+| `IWkP<毫秒>` | 每张网卡每隔这么多毫秒一次 16 MB 的突发，平均每卡 16 / 毫秒数 GB/s（`IWk1g` 就是 `IWkP16`），用来找 16 MB 突发从多低的速率开始有影响 |
 | `IWkT0` `IRkT0` | 同 IWk / IRk，IO 放在 TC 0 |
 | `IWk1` `IRk1` | 只打第一台 decode（C 的 8 张网卡全给它） |
 | `IWhR` | 写进 decode 另一个 NUMA 节点的主机内存 |
