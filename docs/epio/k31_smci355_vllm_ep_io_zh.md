@@ -122,21 +122,21 @@ EP16 是两台 decode（DP2 × TP8）。每个 rank 128 条序列、qlen 8 时�
 
 ### 2.1 流量的量级：EP、KV 和注入的 IO
 
-线速：每张网卡 400 Gb/s，约 50 GB/s；每台 8 张，约 400 GB/s。**除了“每股”（一对网卡），本节的速率都是每台机器 8 张网卡加起来的量**，括号里是平均每张网卡（8 张网卡的流量基本一样，两边的数字都这样换算）。smci355 的数字来自每秒一次的网卡计数（1 秒粒度）。
+线速：每张网卡 400 Gb/s，约 50 GB/s；每台 8 张，约 400 GB/s。**除了“每股”（一对网卡），本节的速率都是每台机器 8 张网卡加起来的量**，括号里是除以 8 得到的平均每张网卡（两边的数字都这样换算）。smci355 上 8 张网卡的流量是均衡的：EP 发送量相差不到 1%，满速 IO 相差约 4%。smci355 的数字来自每秒一次的网卡计数（1 秒粒度）。
 EP 取每台 decode 的发送速率（decode 只发 EP 和很小的 READ 请求）。KV 取每台 decode 的“收减发”：EP 在 decode 之间对称互发，收发抵消；同一台的收和发是同一次采样，不受各台采样时刻错开的影响。各台 decode 的 KV 加起来，和 prefill 的发送速率对得上。
 
 **自然流量和合成负载下的 EP、KV（范围是各台 decode 之间的差别）：**
 
 | 场景 | EP：每台 decode 发出（每张网卡） | KV：流入每台 decode，平均 / 1 秒 p99 / 最大 |
 |---|---|---|
-| smci355 EP16，AgentX 并发 128（pd_6954） | 15.7 GB/s（2.0） | 1.3 / 8–10 / 11–26 GB/s |
-| smci355 EP16，合成 2k / 2k，每个 rank 128 条（pdh_6977） | 35.8 GB/s（4.5） | 0.4 / 2.0–2.4 / 3.1–3.3 GB/s |
-| smci355 EP16，合成 1k / 512，新请求多 4 倍（pdhf_6977） | 35.0 GB/s（4.4） | 1.5 / 5.5–6.3 / 6.7–7.6 GB/s |
-| smci355 EP16，合成 8k / 2k，2 台 prefill（pdh_6976） | 36.4 GB/s（4.6） | 0.5 / 1.7–2.8 / 2.3–5.5 GB/s |
-| smci355 EP32，合成 2k / 512，全局 512（pd32_7006） | 60.1 GB/s（7.5） | 0.9 / 2.7–5.0 / 4.0–6.8 GB/s |
-| smci355 只有 decode：EP16 每个 rank 128 / 256 条（e1i / e1i3）；EP32（e1mi） | 35.6 / 38.9 GB/s（4.5 / 4.9）；61.0 GB/s（7.6） | — |
-| DO 的 SGLang，EP16，AgentX 并发 256（[第一轮](https://github.com/isytwu/sglang/blob/k31-epio-probe-opt4/docs/epio/k31_agentx_ep_kv_umbp_zh.md)） | 约 2.4 GB/s（0.3） | 1.9–2.3 GB/s；100 ms 粒度 p99 38–56、最大 157–243 GB/s |
-| DO 的 SGLang，EP16，合成 512 路在途（[第三轮](https://github.com/isytwu/sglang/blob/k31-epio-probe-opt4/docs/epio/k31_ep512_io_zh.md)） | 约 10.7 GB/s（1.3；decode 入口共 11.6，其余是 KV） | 约 1 GB/s（短请求）到约 5 GB/s（2 台 prefill、多轮长上下文） |
+| smci355 EP16，AgentX 并发 128（pd_6954） | 15.7 GB/s（1.96） | 1.3 / 8–10 / 11–26 GB/s |
+| smci355 EP16，合成 2k / 2k，每个 rank 128 条（pdh_6977） | 35.8 GB/s（4.47） | 0.4 / 2.0–2.4 / 3.1–3.3 GB/s |
+| smci355 EP16，合成 1k / 512，新请求多 4 倍（pdhf_6977） | 35.0 GB/s（4.38） | 1.5 / 5.5–6.3 / 6.7–7.6 GB/s |
+| smci355 EP16，合成 8k / 2k，2 台 prefill（pdh_6976） | 36.4 GB/s（4.55） | 0.5 / 1.7–2.8 / 2.3–5.5 GB/s |
+| smci355 EP32，合成 2k / 512，全局 512（pd32_7006） | 60.1 GB/s（7.51） | 0.9 / 2.7–5.0 / 4.0–6.8 GB/s |
+| smci355 只有 decode：EP16 每个 rank 128 / 256 条（e1i / e1i3）；EP32（e1mi） | 35.6 / 38.9 GB/s（4.46 / 4.86）；61.0 GB/s（7.62） | — |
+| DO 的 SGLang，EP16，AgentX 并发 256（[第一轮](https://github.com/isytwu/sglang/blob/k31-epio-probe-opt4/docs/epio/k31_agentx_ep_kv_umbp_zh.md)） | 约 2.4 GB/s（0.30） | 1.9–2.3 GB/s；100 ms 粒度 p99 38–56、最大 157–243 GB/s |
+| DO 的 SGLang，EP16，合成 512 路在途（[第三轮](https://github.com/isytwu/sglang/blob/k31-epio-probe-opt4/docs/epio/k31_ep512_io_zh.md)） | 约 10.7 GB/s（1.34；decode 入口共 11.6，其余是 KV） | 约 1 GB/s（短请求）到约 5 GB/s（2 台 prefill、多轮长上下文） |
 
 - **EP：** 同样是 AgentX，smci355 并发 128 时每台 15.7 GB/s，DO 并发 256 时约 2.4 GB/s，是 6.5 倍；合成负载是 35–39 对约 10.7 GB/s，3.3–3.6 倍。按每步每台搬的字节算，同样 512 路在途是 21.4 对约 2.6 GB（8 倍，第 1 节）。大头是 vLLM 的 K3.1 没有做 sequence-parallel MoE。即使是 EP32 的每台 60 GB/s，也只是每张网卡 7.5 GB/s，线速的 15%。
 - **KV：** 两边每台平均都只有几 GB/s：smci355 0.4–1.5 GB/s，DO 1–5 GB/s。KV 是按请求成批到达的突发，粒度越细峰值越高：DO 用 100 ms 粒度测到每台 p99 38–56 GB/s，smci355 用 1 秒粒度每台 p99 只有 2–10 GB/s。下面 IWkR16 / IWkR64 两档，就是在模拟这种“每秒到一批”的线速突发。
