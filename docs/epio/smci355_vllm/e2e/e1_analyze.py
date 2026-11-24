@@ -46,7 +46,7 @@ def windows(ev):
             elif name in cur:
                 cuts.append((cur.pop(name), t + 30))
             continue
-        base = re.match(r"^(base|SPIN|I[WR]\w+?)(_io_on|_io_end)?$", name)
+        base = re.match(r"^(base|SPIN|I[WR]\w+?|MK\w*?)(_io_on|_io_end)?$", name)
         if not base:
             continue
         w, kind = base.group(1), base.group(2) or ""

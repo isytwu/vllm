@@ -40,10 +40,22 @@ cleanup() {
             tee -a "$OUT/dcqcn_restore.log"
     fi
     fab_stop "$OUT" "${ALLN[@]}"
+    [ -n "${NICMON:-}" ] && for n in "${ALLN[@]}"; do
+        hx "$n" "pkill -u \$(id -u) -f '[n]icmon.py --out $OUT/'; for d in /sys/class/infiniband/ionic_*; do echo 10 | sudo -n tee \$d/ports/1/hw_counters/lifespan > /dev/null; done; true"
+    done
 }
 trap cleanup EXIT
 wait_idle 180 "${ALLN[@]}" || exit 1
 fab_start "$OUT" "${ALLN[@]}"
+# NICMON=1: tools/nicmon.py on every node for the whole run (each NIC's RDMA byte counters, nicmon_<node>.csv.gz; one
+# core of the last socket). The firmware refreshes the counters every ~10.7 ms; the RDMA core's 10 ms cache of them
+# (hw_counters/lifespan) hands out values up to 10 ms stale, so it drops to 1 ms for the run and back to 10 in cleanup()
+if [ -n "${NICMON:-}" ]; then
+    for n in "${ALLN[@]}"; do
+        hx "$n" "for d in /sys/class/infiniband/ionic_*; do echo 1 | sudo -n tee \$d/ports/1/hw_counters/lifespan > /dev/null; done
+            nohup taskset -c \$((\$(nproc) - 1)) python3 $W/tools/nicmon.py --out $OUT/nicmon_$n.csv.gz > $OUT/nicmon_$n.log 2>&1 < /dev/null &"
+    done
+fi
 # DCQCN_RULES="prio 0x8 1" [DCQCN_DEFAULT=1]: every port's match_rules (and match_default) for this run, so that its QPs
 # (EP, KV, IO; created from here on) get that DCQCN profile; MoRI's QPs carry SL 0, so only DCQCN_DEFAULT reaches them.
 # cleanup() puts every port back however the run ends (mb/dcqcn_bind.sh, needs sudo on the hosts)

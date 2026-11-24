@@ -31,6 +31,19 @@
 #                          back; suffix T0 = in TC 0, S = in 1 MB batches, p<n> = each flow at <n> GB/s per NIC
 #                          (IWk1x2p10: 20 GB/s into each of the target's NICs, 40 % of line rate)
 #   IRk1x2 / IRk1x3        the same with the first target reading the 2 / 3 sources at once
+#   MK[R][Hn|Hf][x<k>[i]|B][T0][l|h][p<n>|s|c<n>]  KV transfers shaped like Moonshot's decode-side 10 ms traces (io_inject's KV mode): into each
+#                          target, MK_RATE (6.7) transfers per second, each MK_MB (1024) MB on each of MK_NICS (3) of
+#                          its 8 NICs, as MK_CHUNK_MB (16) MB batches, MK_INFLIGHT (2) in flight, at line rate (about
+#                          2.5 transfers / s / NIC: 300-400 Gb/s spikes of 20-30 ms). R = the target reads them from C
+#                          (MoRIIO's direction), T0 = in TC 0, l / h = a quarter / twice the rate, p<n> = each NIC
+#                          capped at <n> GB/s within a transfer, s = 1 MB batches one at a time, c<n> = <n> MB batches
+#                          one at a time, Hn / Hf = into the
+#                          target's pinned host memory on its NIC's NUMA node / the other one (a KV store's DRAM pool,
+#                          like Mooncake Store's) instead of its GPUs, x<k> = the first k IO sources (C, then SOURCES)
+#                          into the first target, each at 1/k of the rate (the same bytes as one source), i = all of
+#                          them on one schedule (every transfer lands on the same NICs from every source at once: k:1
+#                          incast), B = the second IO source alone. A source that is a decode node sends from host memory
+#                          (its GPUs are the decode's)
 # logs/windows_<run>.txt (e.g. windows_e1m_6855.txt), when it exists, replaces WINDOWS (and WINDOWS_ADD) for that run.
 #   IRb / IWb    mori's IO benchmark (8 GPU pairs, 32 KB transfers, batches of 8192) between C and every target: the
 #                targets read C (IRb) or C writes them (IWb). In the microbenchmarks IRb's pattern (thousands of small
@@ -78,6 +91,25 @@ window() {
         k=${BASH_REMATCH[1]} mod=${BASH_REMATCH[2]}
         (( k <= ${#srcs[@]} )) || { ev "$name" "skipped: $k IO sources wanted, ${#srcs[@]} given"; return 0; }
     fi
+    local kvargs="" kvmem="" kvsrc=0 s pm im
+    if [[ $name =~ ^MK(R?)(H[nf])?(x[2-9]i?|B)?(T0)?([lh]?)(p[0-9]+|s|c[0-9]+)?$ ]]; then
+        local xs=${BASH_REMATCH[3]} lv=${BASH_REMATCH[5]} md=${BASH_REMATCH[6]} rate=${MK_RATE:-6.7}
+        [ -n "${BASH_REMATCH[4]}" ] && tc=0
+        case ${BASH_REMATCH[2]} in Hn) kvmem="--mem host --numa local" ;; Hf) kvmem="--mem host --numa remote" ;; esac
+        case $lv in l) rate=$(awk -v r="$rate" 'BEGIN { print r / 4 }') ;; h) rate=$(awk -v r="$rate" 'BEGIN { print r * 2 }') ;; esac
+        mb=${MK_CHUNK_MB:-16} inf=${MK_INFLIGHT:-2}
+        case $md in s) mb=1 inf=1 ;; c*) mb=${md#c} inf=1 ;; p*) kvargs="--pace-gbps ${md#p}" ;; esac
+        case $xs in
+            x*) k=${xs:1:1}
+                (( k <= ${#srcs[@]} )) || { ev "$name" "skipped: $k IO sources wanted, ${#srcs[@]} given"; return 0; }
+                tg=("${tg[0]}") kvsrc=$(seq -s ' ' 0 $((k - 1)))
+                rate=$(awk -v r="$rate" -v k="$k" 'BEGIN { print r / k }')
+                [[ $xs == *i ]] && kvargs="--kv-shared $kvargs" ;;
+            B)  (( ${#srcs[@]} >= 2 )) || { ev "$name" "skipped: a second IO source wanted"; return 0; }
+                tg=("${tg[0]}") kvsrc=1 ;;
+        esac
+        kvargs="--kv-mb ${MK_MB:-1024} --kv-rate $rate --kv-nics ${MK_NICS:-3} $kvargs"
+    fi
     ev "$name" start
     case "$name" in
         I[WR]k1x[2-9]*)
@@ -123,6 +155,30 @@ window() {
         IWk|IWk10|IWkT0|IWk1|IWk1T0|IWk1S|IWk1p20|IWk1p10|IWk1p5|IWk1p2|IWk5|IWk2|IWk1g|IWk1gS|IWk1gB|IWk10S|IWk5S|IWkS|IWk10c2|IWk10c4|IWk10c8|IWkSi4|IWkSi16|IWkR16|IWkR64|IWkP[0-9]*)
             for t in "${tg[@]}"; do
                 inj_start "$OUT/inj_${name}_$cyc/$t" "$tc" write "$C" "$t" --chunk-mb $mb --period-ms $per --inflight $inf --duration $((WIN + 120))
+            done ;;
+        MKR*)
+            # the target reads into its own buffer (host memory: INJ_IMEM) from each source; a decode node serving the
+            # reads holds them in host memory (INJ_PMEM)
+            for t in "${tg[@]}"; do
+                for i in $kvsrc; do
+                    s=${srcs[$i]} pm="--mem gpu"
+                    [[ " $DECODE " == *" $s "* ]] && pm="--mem host --numa local"
+                    INJ_IMEM="${kvmem:---mem gpu}" INJ_PMEM="$pm" inj_start "$OUT/inj_${name}_$cyc/${t}_$s" "$tc" read "$t" "$s" --chunk-mb $mb --inflight $inf $kvargs --duration $((WIN + 120))
+                done
+            done ;;
+        MK*)
+            # host memory needs fresh receivers (PRE_RECV's hold GPU buffers); a decode node as the source sends from
+            # host memory
+            for t in "${tg[@]}"; do
+                for i in $kvsrc; do
+                    s=${srcs[$i]} im="--mem gpu"
+                    [[ " $DECODE " == *" $s "* ]] && im="--mem host --numa local"
+                    if [ -n "$kvmem" ]; then
+                        INJ_NOPRE=1 INJ_PMEM="$kvmem" INJ_IMEM="$im" inj_start "$OUT/inj_${name}_$cyc/${t}_$s" "$tc" write "$s" "$t" --chunk-mb $mb --inflight $inf $kvargs --duration $((WIN + 120))
+                    else
+                        INJ_SRC_IDX=$i INJ_IMEM="$im" inj_start "$OUT/inj_${name}_$cyc/${t}_$s" "$tc" write "$s" "$t" --chunk-mb $mb --inflight $inf $kvargs --duration $((WIN + 120))
+                    fi
+                done
             done ;;
         IWhR)
             for t in "${tg[@]}"; do

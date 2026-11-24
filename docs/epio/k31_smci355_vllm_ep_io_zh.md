@@ -2,6 +2,7 @@
 
 DO 上的三轮（SGLang，在 isytwu/sglang 的 `k31-epio-probe-opt4` 分支）：[k31_agentx_ep_kv_umbp_zh.md](https://github.com/isytwu/sglang/blob/k31-epio-probe-opt4/docs/epio/k31_agentx_ep_kv_umbp_zh.md)、[k31_ep_kv_read_write_zh.md](https://github.com/isytwu/sglang/blob/k31-epio-probe-opt4/docs/epio/k31_ep_kv_read_write_zh.md)、[k31_ep512_io_zh.md](https://github.com/isytwu/sglang/blob/k31-epio-probe-opt4/docs/epio/k31_ep512_io_zh.md)。
 复现指南：[k31_smci355_vllm_ep_io_repro_zh.md](k31_smci355_vllm_ep_io_repro_zh.md)。脚本在 [smci355_vllm/](smci355_vllm/)。
+按 Moonshot 截图里的流量复现（10 ms 网卡监控、Grafana、KV 走 TC 0、incast、拆小提交）：[k31_smci355_moonshot_traffic_zh.md](k31_smci355_moonshot_traffic_zh.md)。
 
 Moonshot 在 EP32、全局 batch 512、qlen 8 上看到过 IO 突发让 EP 明显变慢。DO 上的结论是：一个 IO 来源几乎不影响，要多个来源同时打进一台 decode（incast）才会明显变慢。
 这里换了一套集群（smci355，6 台 MI355X）和推理框架（vLLM，DO 用的是 SGLang）做对照：

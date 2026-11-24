@@ -19,6 +19,13 @@ MoRI connector's per-layer page runs. Backend config = sglang's (4 QP/transfer, 
 CQ polling). --mem host registers pinned host memory on both ends: NIC DMA without the GPU.
 
 Per burst: t_submit, t_done (wall clock), bytes -> DIR/io_dev<i>.npz; prints a summary.
+
+KV mode (--kv-mb > 0) replaces the periodic bursts with KV transfers like a PD decode receives them: transfers arrive
+at the peer node as a Poisson process of --kv-rate per second, each on --kv-nics of its --kv-ndev NICs at random (every
+device's process draws the same schedule from --kv-seed and the peer's and its own host; with --kv-shared from --kv-seed
+alone, so several sources burst at once on the same NICs: incast), and each moves --kv-mb per NIC as
+batches of --chunk-mb with --inflight of them in flight, back to back or capped at --pace-gbps per NIC. A transfer
+that arrives while the previous one still runs waits for it. Per transfer: arrival, start, end, bytes (kv_* in the npz).
 """
 import argparse
 import json
@@ -28,6 +35,7 @@ import pickle
 import socket
 import struct
 import time
+import zlib
 
 
 def parse_devs(s):
@@ -251,6 +259,9 @@ def _sender(dev, args, out_q, stop):
     assert eng.wait_all(st) == mio.StatusCode.SUCCESS
     if args.start_at:
         time.sleep(max(0.0, args.start_at - time.time()))
+    if args.kv_mb > 0:
+        _kv_sender(dev, args, out_q, stop, sock, eng, xfer, chunk, nseg * seg, mio.StatusCode.SUCCESS)
+        return
     t0 = time.time()
     t_sub, t_done, nb = [], [], []
     pending = []
@@ -296,6 +307,81 @@ def _sender(dev, args, out_q, stop):
              meta=json.dumps({"dev": dev, "args": vars(args), "host": socket.gethostname()}))
 
 
+def kv_schedule(args, dev):
+    """Arrival offsets (s from the start) of the KV transfers that land on device dev's NIC: the node's transfers
+    arrive at --kv-rate per second, each on --kv-nics of its --kv-ndev NICs; every device draws the same sequence"""
+    import numpy as np
+
+    key = "" if args.kv_shared else f"{args.peer}|{socket.gethostname()}"
+    rng = np.random.default_rng(args.kv_seed + zlib.crc32(key.encode()))
+    t, out = 0.0, []
+    while t < args.duration:
+        t += rng.exponential(1.0 / args.kv_rate)
+        if dev in rng.choice(args.kv_ndev, size=min(args.kv_nics, args.kv_ndev), replace=False):
+            out.append(t)
+    return out
+
+
+def _wait_until(t_at, stop):
+    while not stop.is_set():
+        d = t_at - time.time()
+        if d <= 0:
+            return True
+        if d > 0.002:
+            time.sleep(min(d - 0.001, 0.05))
+    return False
+
+
+def _kv_sender(dev, args, out_q, stop, sock, eng, xfer, chunk, cbytes, ok):
+    import numpy as np
+
+    nchunks = max(1, round(args.kv_mb * (1 << 20) / cbytes))
+    gap = cbytes / (args.pace_gbps * 1e9) if args.pace_gbps > 0 else 0.0
+    t0 = time.time()
+    kv_a, kv_s, kv_d = [], [], []
+    t_sub, t_done = [], []
+    c = 0
+    for off in kv_schedule(args, dev):
+        if off >= args.duration or not _wait_until(t0 + off, stop):
+            break
+        ts_start, pending, nxt = time.time(), [], time.time()
+        for _ in range(nchunks):
+            if gap and not _wait_until(nxt, stop):
+                break
+            nxt += gap
+            ts = time.time()
+            pending.append((ts, xfer(*chunk(c), [eng.allocate_transfer_uid()])))
+            c += 1
+            while len(pending) >= args.inflight:
+                ts0, st0 = pending.pop(0)
+                rc = eng.wait_all(st0)
+                t_sub.append(ts0); t_done.append(time.time())
+                if rc != ok:
+                    out_q.put((dev, {"error": f"transfer failed rc={rc}"}))
+                    return
+        for ts0, st0 in pending:
+            eng.wait_all(st0)
+            t_sub.append(ts0); t_done.append(time.time())
+        kv_a.append(t0 + off); kv_s.append(ts_start); kv_d.append(time.time())
+        if stop.is_set():
+            break
+    t1 = time.time()
+    send_msg(sock, "done")
+    sock.close()
+    kv_a, kv_s, kv_d = np.array(kv_a), np.array(kv_s), np.array(kv_d)
+    kvb = np.full(kv_a.size, nchunks * cbytes)
+    dur, lat = (kv_d - kv_s) * 1e3, (kv_d - kv_a) * 1e3
+    pct = lambda x, q: float(np.percentile(x, q)) if x.size else None  # noqa: E731
+    out_q.put((dev, dict(kv_transfers=int(kv_a.size), gbps=float(kvb.sum() / (t1 - t0) / 1e9),
+                         kv_ms_p50=pct(dur, 50), kv_ms_p99=pct(dur, 99), kv_lat_ms_p50=pct(lat, 50),
+                         kv_lat_ms_p99=pct(lat, 99),
+                         kv_gbps_p50=float(np.median(kvb / (kv_d - kv_s)) / 1e9) if kv_a.size else None)))
+    os.makedirs(args.out, exist_ok=True)
+    np.savez(os.path.join(args.out, f"io_dev{dev}.npz"), t_submit=np.array(t_sub), t_done=np.array(t_done),
+             bytes=np.full(len(t_sub), cbytes), kv_arrive=kv_a, kv_start=kv_s, kv_done=kv_d, kv_bytes=kvb,
+             meta=json.dumps({"dev": dev, "args": vars(args), "host": socket.gethostname()}))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("role", choices=["recv", "send"])
@@ -318,6 +404,14 @@ def main():
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--duration", type=float, default=30.0)
     ap.add_argument("--start-at", type=float, default=0.0, help="wall-clock start time")
+    ap.add_argument("--kv-mb", type=float, default=0.0, help="KV mode: MB per NIC per transfer (0 = periodic bursts)")
+    ap.add_argument("--kv-rate", type=float, default=1.0, help="KV mode: transfers per second into the peer node")
+    ap.add_argument("--kv-nics", type=int, default=3, help="KV mode: NICs each transfer lands on")
+    ap.add_argument("--kv-ndev", type=int, default=8, help="KV mode: the peer's NICs to pick from")
+    ap.add_argument("--kv-seed", type=int, default=1)
+    ap.add_argument("--kv-shared", action="store_true",
+                    help="KV mode: the schedule from --kv-seed alone, the same in every sender (sources burst together)")
+    ap.add_argument("--pace-gbps", type=float, default=0.0, help="KV mode: cap per NIC within a transfer (0 = none)")
     ap.add_argument("--accept-timeout", type=float, default=600)
     ap.add_argument("--serve-forever", action="store_true")
     ap.add_argument("--out", default="/tmp/io_inject")
