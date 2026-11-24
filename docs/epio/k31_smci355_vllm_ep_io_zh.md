@@ -5,7 +5,8 @@ DO 上的三轮（SGLang，在 isytwu/sglang 的 `k31-epio-probe-opt4` 分支）
 
 Moonshot 在 EP32、全局 batch 512、qlen 8 上看到过 IO 突发让 EP 明显变慢。DO 上的结论是：一个 IO 来源几乎不影响，要多个来源同时打进一台 decode（incast）才会明显变慢。
 这里换了一套集群（smci355，6 台 MI355X）和推理框架（vLLM，DO 用的是 SGLang）做对照：
-- decode 用宽 EP。每个 EP rank 每次 dispatch 128 个 token，和 Moonshot 那个 case 每个 rank 的负载相同。
+- decode 用宽 EP，每个 DP rank 128 条序列、qlen 8（EP32 时全局 batch 512，和 Moonshot 那个 case 一样）。
+  **注意：这个 vLLM 的 K3.1 没有做 sequence-parallel MoE**，8 张 TP 卡各自把整个 DP batch 发一遍，每个 EP rank 实际 dispatch 1024 个 token，EP 数据是按 128 个 token 算的 8 倍（第 1 节）。
 - 测了两类场景：
   - 只有 decode，外加注入的 IO；
   - 真实 PD，负载分别是 AgentX 和合成负载，看自然的 KV 流量，也在上面再注入 IO。
@@ -72,6 +73,7 @@ Moonshot 在 EP32、全局 batch 512、qlen 8 上看到过 IO 突发让 EP 明�
   - 条件和 EP16 一样：IO 和 EP 同在 TC 104，而且以接近线速到达 decode 的网卡。最重的是 1 台 decode 以线速读（+28%），也就是 MoRIIO 拉 KV 的方向。
   - EP32 没有 IO 时 EP 自己就在被 ECN 标记（每台 decode 每秒 4–6 千个 CNP），队列本来就有积压，再来同 TC 的突发，EP 排得更久。
   - 两个来源同时打进一台 decode（2:1 incast）时更重：写 +30%，读 +56%（第 7 节）。
+  - 但这里的 EP 比 Moonshot 的重：vLLM 的 K3.1 没有做 sequence-parallel MoE，每个 EP rank dispatch 1024 个 token。如果 Moonshot 做了，他们每个 rank 是 128 个，EP 数据是我们的 1/8，上面的幅度不能直接套用（第 1 节）。
 - 一个 IO 来源就足以让 EP 明显变慢（EP16 慢一半以上），不一定要 incast。前提是两个：
   - IO 和 EP 在同一个流量类；
   - IO 一次提交几 MB 以上，能以线速打进 decode 的网卡。
@@ -96,7 +98,12 @@ Moonshot 在 EP32、全局 batch 512、qlen 8 上看到过 IO 突发让 EP 明�
 | prefill（PD 时） | TP8 · DCP8，fcfs（这个版本的 shortest-prefill-first 必须配 SimpleCPUOffloadConnector） |
 | KV 传输（PD 时） | vLLM MoRIIO 连接器 READ 模式，代理是自己写的 `e2e/pd_proxy.py`，按 AIPerf 的会话头做亲和 |
 
-EP16 是两台 decode（DP2 × TP8）。每个 rank 128 条序列、qlen 8 时，每个 EP rank 每次 dispatch 128 个 token，和 EP32、全局 512 时每个 rank 的量相同。这时每步约 300 ms，decode 每台的 EP 收发约 35 GB/s。
+EP16 是两台 decode（DP2 × TP8）。每个 rank 128 条序列、qlen 8 时，一个 DP rank 每步有 1024 个 token 过 MoE。
+
+**每个 EP rank 实际 dispatch 1024 个 token，不是 128 个。**
+- 这个镜像里 K3.1 的 AMD 实现（`vllm/models/kimi_k3/amd/linear.py` 的 `KimiMoE.forward`）把整个 DP batch 直接交给专家层：没有像上游 DeepSeek 那样先按 TP rank 切开（`sequence_parallel_chunk`）、算完再 all-gather，创建专家层时也没有打开 `is_sequence_parallel`。所以 8 张 TP 卡各发一遍整个 DP batch，EP 数据是开 sequence parallel 时的 8 倍。
+- 实测：每台 decode 的 EP 收发约 35.6 GB/s，每步每台 10.7 GB；DO 上的 SGLang 在 512 路在途时是每步每台约 2.6 GB（第 7 节）。
+- 如果 Moonshot 那边做了 sequence parallel，他们 EP32、全局 512 时每个 rank 是 128 个 token，我们的 EP 数据是他们的 8 倍。这一点 DO 测试的 agent 指出过。这时每步约 300 ms，decode 每台的 EP 收发约 35 GB/s。
 
 ## 2. 方法
 
@@ -328,8 +335,8 @@ TTFT 拆成两段：prefill 那一路，以及“prefill 完成到首个 token�
 
 - **smci355 一个来源就很重，incast 是 DO 的 3.6–6 倍；IO 走 TC 0，两边都能完全消除。**
 - **两边的 EP 本身就差很多（vLLM 对 SGLang）：** 同样 512 路在途，smci355 每步每台搬 21.4 GB 的 EP 数据，DO 约 2.6 GB（8 倍）；单次 dispatch + combine 是 2,117 µs 对 315 µs，EP 占每步的 23% 对约 8%。
-  - vLLM 走 MoRI 的低延迟内核（InterNodeV1LL），SGLang 走 EPv2；差在 dispatch 的数据格式和是否按节点去重，是推测，没有核实。
-  - EP 的数据多、占比大，同样的排队就更明显地落到步时上。这一点和下面的交换机差别谁占主导，作业 7112 在测：把每个 rank 降到 32 条，每步每台的 EP 数据约 2.7 GB，和 DO 相当，再看单来源的影响。
+  - 大头是 vLLM 的 K3.1 没有做 sequence-parallel MoE：8 张 TP 卡各发一遍整个 DP batch，每个 EP rank dispatch 1024 个 token（第 1 节）。
+  - EP 的数据多、占比大，同样的排队就更明显地落到步时上。这一点和下面的交换机差别谁占主导，作业 7112 在测：每个 rank 16 / 32 / 64 条，16 条时 EP 数据等于“128 条加 sequence parallel”，32 条时和 DO 相当，再看单来源的影响。
 - **另一个差别在交换机能堆多深的队列。**
   - DO 上 3:1 时交换机暂停发送方 6–8% 的时间，队列被 PFC 截住，incast 给每次 EP 只多加约 0.2 ms。
   - smci355 上 3:1 也没有一次 PFC。发送端也不受 DCQCN 限制（第 4 节），只是每张卡一批在途、自己慢下来，于是每个端口前面一直排着几十 MB：每批 16 MB 要 1.1–1.3 ms 才完成，不拥塞时是 0.41 ms。EP 的包排在同一个队列里，也要多等这么久。
@@ -340,7 +347,7 @@ TTFT 拆成两段：prefill 那一路，以及“prefill 完成到首个 token�
 
 ## 8. 单测（简）
 
-EP16，v1 内核每卡 128 个 token：base 时 dispatch / combine 是 163 / 111 µs。
+EP16，v1 内核每卡 128 个 token：base 时 dispatch / combine 是 163 / 111 µs。端到端里每卡实际 dispatch 1024 个 token（第 1 节），这是单测低估影响的原因之一。
 
 | IO（第三台机器 ↔ 一台 EP 节点） | v1 dispatch / combine |
 |---|---|

@@ -100,7 +100,8 @@ tail -f logs/launch_$J.log
 
 - **节点：** 3 台。A 和 B 是 decode，DP2 × TP8 = EP16，每台一个 DP rank；C 跑负载和注入。
 - **负载：** `e2e/loadgen.py`，每个 rank 128 条流。随机 token，输入 1024、输出 8000 ± 50%，忽略 EOS，所以 batch 一直是满的。
-  每个 EP rank 每次 dispatch 128 个 token，每步约 300 ms。
+  每步约 300 ms。注意这个 vLLM 的 K3.1 没有做 sequence-parallel MoE：8 张 TP 卡各发一遍整个 DP batch，每个 EP rank 实际 dispatch 1024 个 token，每步每台约 10.7 GB 的 EP 数据（DO 上的 SGLang 约 2.6 GB）。
+  要让 EP 数据和“128 个 token 加 sequence parallel”一样，用每个 rank 16 条（`CONC=16`，`SERVE_ENV="MAX_SEQS=16"`）。
 - **注入：** `mb/io_inject.py`（MoRI IO，KV 形状：72 KiB 一段，每批 N MB，GPU i ↔ GPU i，8 张网卡都用），从 C 往两台 decode 写或读。
   每个窗口 120 秒、间隔 60 秒；最后一个窗口固定是 base（无 IO）。
 
