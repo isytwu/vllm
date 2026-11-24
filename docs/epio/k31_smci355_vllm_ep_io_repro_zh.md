@@ -113,7 +113,7 @@ echo "base IWk IWkT0 IWk1g IWk10c4 IWkS IRk IRkT0 IWk1" > logs/windows_e1_$J.txt
 cp tools/launch.sh logs/run_launch_$J.sh && setsid nohup bash logs/run_launch_$J.sh $J >> logs/nohup_launch_$J.out 2>&1 < /dev/null &
 ```
 
-**窗口一览**（定义在 `e2e/windows.sh`，可以自己加）：
+**窗口一览**（定义在 `e2e/windows.sh`，可以自己加；每一档实际打进 decode 多少，以及和 EP、自然 KV 流量的量级对比，见结论文档第 2.1 节）：
 
 | 名字 | IO |
 |---|---|
