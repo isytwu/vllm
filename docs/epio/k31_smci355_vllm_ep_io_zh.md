@@ -339,7 +339,7 @@ TTFT 拆成两段：prefill 那一路，以及“prefill 完成到首个 token�
   - 10 分钟后 RCCL watchdog 发现 TP 组的 all-gather 超时，杀掉进程，4 个引擎全部退出；
   - 这台 decode 上有一个进程到作业结束都没杀掉，Slurm 把节点（n09-21）置成了 drain（`Kill task failed`）。
 - 第三次是同样的 pd32a 重跑（作业 7101）：AgentX 开始后 1 分钟（只完成了 12 个请求）decode 就不再出 token，10 分钟后 RCCL watchdog 发现 DP3 的 TP 组 all-gather 超时。**EP32 加 AgentX 两次都挂死**，合成负载的 EP32 PD（pd32、pd32t0）和 EP16 加 AgentX 都没挂过。
-- 三次的表现一样：其他 rank 停在 TP 的 all-gather 上，等一个停在 EP 内核里的 rank。都发生在 decode 上另一个 RDMA 引擎有动作的时候（io_inject 的接收进程启动；MoRIIO 拉 AgentX 长上下文请求的 KV）。原因没查清，作业 7110 在排查：同样负载下 KV 换到 TC 0，以及不用 AgentX、只用 32k 输入的合成负载。
+- 三次的表现一样：其他 rank 停在 TP 的 all-gather 上，等一个停在 EP 内核里的 rank。都发生在 decode 上另一个 RDMA 引擎有动作的时候（io_inject 的接收进程启动；MoRIIO 拉 AgentX 长上下文请求的 KV）。原因没查清。排查用的作业 7110（同样负载下 KV 换到 TC 0，以及不用 AgentX、只用 32k 输入的合成负载）暂缓。
 
 ### 6.4 真实 PD（作业 7006）
 
