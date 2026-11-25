@@ -1,0 +1,5 @@
+ainic-netmon (ROCm/mori PR #1000), built from the PR head c55b89eb (2026-11-19, "netmon: run the unit tests in CI")
+checked out at /apps/ditian12/netmon_pr1000/mori_pr1000_head:
+  cmake -S tools/netmon -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+tools/netmon_report/ and monitor/grafana-conf/dashboards/netmon_*.json are the same PR's report / import scripts and
+dashboards (tools/netmon/report, examples/monitoring/netmon/grafana/dashboards).

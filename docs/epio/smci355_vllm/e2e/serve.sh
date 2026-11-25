@@ -66,4 +66,8 @@ printf ' %q' vllm serve "$MODEL" "${ARGS[@]}" "$@"; echo
 /opt/runtime-venv/bin/python /opt/k31-pr26/prepare_role.py || exit 3
 # srt-slurm's k31-ms.sh setup step: the image's prebuilt aiter fmha module instead of a JIT build
 /opt/runtime-venv/bin/python /opt/k31-r10/reuse_aiter_module.py || echo "reuse_aiter_module failed"
+# YT_STEP_TICK_PORT: every step's start announced over UDP to the KV injectors (e2e/step_tick_patch.py); DP rank 0
+# only, the DP ranks step together and one tick per step is what a gated injector expects
+[ "$dp_rank" = 0 ] || unset YT_STEP_TICK_PORT
+if [ -n "${YT_STEP_TICK_PORT:-}" ]; then /opt/runtime-venv/bin/python "$W/e2e/step_tick_patch.py" || exit 3; fi
 exec /opt/runtime-venv/bin/vllm serve "$MODEL" "${ARGS[@]}" "$@"

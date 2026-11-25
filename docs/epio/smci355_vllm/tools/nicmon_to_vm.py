@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """nicmon_to_vm.py: load a run's nicmon traces (and its windows and step times) into VictoriaMetrics for Grafana.
 
-  python3 tools/nicmon_to_vm.py results/e2e/<run> [--vm http://127.0.0.1:18428] [--bin-ms <ms>]
+  python3 tools/nicmon_to_vm.py results/e2e/<run> [--vm http://127.0.0.1:28528] [--bin-ms <ms>]
 
 Series (labels run, node, nic):
   nic_rx_gbps / nic_tx_gbps      each NIC's RDMA bytes, Gb/s: the average between two consecutive reads of that NIC,
@@ -46,7 +46,7 @@ def series(name, labels, ts, vals, vm, chunk=60000):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("run_dir")
-    ap.add_argument("--vm", default="http://127.0.0.1:18428")
+    ap.add_argument("--vm", default="http://127.0.0.1:28528")
     ap.add_argument("--bin-ms", type=float, default=0.0, help="resample onto this grid (0 = each read interval)")
     a = ap.parse_args()
     run = os.path.basename(os.path.normpath(a.run_dir))

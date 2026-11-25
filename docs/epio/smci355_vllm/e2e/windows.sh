@@ -31,13 +31,15 @@
 #                          back; suffix T0 = in TC 0, S = in 1 MB batches, p<n> = each flow at <n> GB/s per NIC
 #                          (IWk1x2p10: 20 GB/s into each of the target's NICs, 40 % of line rate)
 #   IRk1x2 / IRk1x3        the same with the first target reading the 2 / 3 sources at once
-#   MK[R][Hn|Hf][x<k>[i]|B][T0][l|h][p<n>|s|c<n>]  KV transfers shaped like Moonshot's decode-side 10 ms traces (io_inject's KV mode): into each
+#   MK[R][Hn|Hf][x<k>[i]|B][T0][l|h][p<n>|s|c<n>|g]  KV transfers shaped like Moonshot's decode-side 10 ms traces (io_inject's KV mode): into each
 #                          target, MK_RATE (6.7) transfers per second, each MK_MB (1024) MB on each of MK_NICS (3) of
 #                          its 8 NICs, as MK_CHUNK_MB (16) MB batches, MK_INFLIGHT (2) in flight, at line rate (about
 #                          2.5 transfers / s / NIC: 300-400 Gb/s spikes of 20-30 ms). R = the target reads them from C
 #                          (MoRIIO's direction), T0 = in TC 0, l / h = a quarter / twice the rate, p<n> = each NIC
 #                          capped at <n> GB/s within a transfer, s = 1 MB batches one at a time, c<n> = <n> MB batches
-#                          one at a time, Hn / Hf = into the
+#                          one at a time, g = only as the decode starts a step, at most MK_GATE_MB (256) MB per NIC
+#                          per step (the serve's YT_STEP_TICK_PORT = MK_GATE_PORT, 47000; the ticks of DP rank 0, the
+#                          first decode node: target it alone, TARGETS), Hn / Hf = into the
 #                          target's pinned host memory on its NIC's NUMA node / the other one (a KV store's DRAM pool,
 #                          like Mooncake Store's) instead of its GPUs, x<k> = the first k IO sources (C, then SOURCES)
 #                          into the first target, each at 1/k of the rate (the same bytes as one source), i = all of
@@ -53,7 +55,27 @@
 # capture times. snaps.jsonl has every node's RDMA counters (mb/snap.sh: CNPs and ECN-marked packets received,
 # retransmissions, PFC) once the IO runs (<window>_<cycle>_a) and before it stops (_b).
 EV=$OUT/events.tsv
-ev() { printf '%s\t%s\t%s\n' "$(date +%s.%N)" "$1" "$2" | tee -a "$EV"; }
+# EPIO_PUSH=<VictoriaMetrics URL>: every event also goes there (epio_event), and the windows as states (epio_window 1 at
+# a window's start, 0 at its end; epio_io 1 / 0 while its IO runs), under experiment $EPIO_EXP, for the experiment's
+# Grafana dashboard (tools/epio_dash.py). Posted in the background: a slow VictoriaMetrics never holds a run up.
+epio_lines() {
+    [ -n "${EPIO_PUSH:-}" ] || return 0
+    printf '%s\n' "$@" | curl -s -m 5 --data-binary @- "$EPIO_PUSH/api/v1/import/prometheus" > /dev/null 2>&1 &
+}
+ev() {
+    local ts; ts=$(date +%s.%N)
+    printf '%s\t%s\t%s\n' "$ts" "$1" "$2" | tee -a "$EV"
+    [ -n "${EPIO_PUSH:-}" ] || return 0
+    local ms=${ts%.*}${ts#*.} l="experiment=\"${EPIO_EXP:-$RUN}\",run=\"$RUN\"" out=()
+    ms=${ms:0:13}
+    out+=("epio_event{$l,name=\"$1\"} 1 $ms")
+    case $2 in start) out+=("epio_window{$l,name=\"$1\"} 1 $ms") ;; end) out+=("epio_window{$l,name=\"$1\"} 0 $ms") ;; esac
+    case $1 in
+        *_io_on) out+=("epio_io{$l,name=\"${1%_io_on}\"} 1 $ms") ;;
+        *_io_end) out+=("epio_io{$l,name=\"${1%_io_end}\"} 0 $ms") ;;
+    esac
+    epio_lines "${out[@]}"
+}
 IOB="--enable-batch-transfer --enable-sess --buffer-size 32768 --transfer-batch-size 8192 --iters 1000000000 --num-initiator-dev 8 --num-target-dev 8"
 
 profile() {
@@ -67,6 +89,10 @@ profile() {
     for u in $PROF_URLS; do hx "${u%%:*}" "curl -s -m 600 -X POST http://127.0.0.1:${u##*:}/stop_profile" > /dev/null & cp+=($!); done
     wait "${cp[@]}"
     ev "prof_$1" end
+    # the capture's MoRI dispatch / combine kernel times to the dashboard (tools/ep_push.py parses its traces)
+    [ -n "${EPIO_PUSH:-}" ] && nohup python3 "$W/tools/ep_push.py" "$OUT" "prof_$1" --push "$EPIO_PUSH" \
+        --experiment "${EPIO_EXP:-$RUN}" >> "$OUT/ep_push.log" 2>&1 < /dev/null &
+    return 0
 }
 
 # io_nodes: C and the other IO sources (SOURCES, e2e/e1.sh), each once, C first
@@ -92,13 +118,18 @@ window() {
         (( k <= ${#srcs[@]} )) || { ev "$name" "skipped: $k IO sources wanted, ${#srcs[@]} given"; return 0; }
     fi
     local kvargs="" kvmem="" kvsrc=0 s pm im
-    if [[ $name =~ ^MK(R?)(H[nf])?(x[2-9]i?|B)?(T0)?([lh]?)(p[0-9]+|s|c[0-9]+)?$ ]]; then
-        local xs=${BASH_REMATCH[3]} lv=${BASH_REMATCH[5]} md=${BASH_REMATCH[6]} rate=${MK_RATE:-6.7}
+    if [[ $name =~ ^MK(R?)(H[nf])?(x[2-9]i?|B)?(T0)?([lh]?)(p[0-9]+|s|c[0-9]+|g)?$ ]]; then
+        local xs=${BASH_REMATCH[3]} lv=${BASH_REMATCH[5]} md=${BASH_REMATCH[6]} rate=${MK_RATE:-6.7} rd=${BASH_REMATCH[1]}
         [ -n "${BASH_REMATCH[4]}" ] && tc=0
         case ${BASH_REMATCH[2]} in Hn) kvmem="--mem host --numa local" ;; Hf) kvmem="--mem host --numa remote" ;; esac
         case $lv in l) rate=$(awk -v r="$rate" 'BEGIN { print r / 4 }') ;; h) rate=$(awk -v r="$rate" 'BEGIN { print r * 2 }') ;; esac
         mb=${MK_CHUNK_MB:-16} inf=${MK_INFLIGHT:-2}
-        case $md in s) mb=1 inf=1 ;; c*) mb=${md#c} inf=1 ;; p*) kvargs="--pace-gbps ${md#p}" ;; esac
+        case $md in
+            s) mb=1 inf=1 ;; c*) mb=${md#c} inf=1 ;; p*) kvargs="--pace-gbps ${md#p}" ;;
+            # g: the decode's DP rank 0 sends its step ticks to itself and to C (e2e/e1.sh YT_STEP_TICK_HOSTS)
+            g) kvargs="--gate-port ${MK_GATE_PORT:-47000} --gate-mb ${MK_GATE_MB:-256}"
+               [ -z "$rd" ] && kvargs="$kvargs --gate-bind 0.0.0.0" ;;
+        esac
         case $xs in
             x*) k=${xs:1:1}
                 (( k <= ${#srcs[@]} )) || { ev "$name" "skipped: $k IO sources wanted, ${#srcs[@]} given"; return 0; }
@@ -111,6 +142,7 @@ window() {
         kvargs="--kv-mb ${MK_MB:-1024} --kv-rate $rate --kv-nics ${MK_NICS:-3} $kvargs"
     fi
     ev "$name" start
+    EPIO_WIN=$name
     case "$name" in
         I[WR]k1x[2-9]*)
             tg=("${tg[0]}")

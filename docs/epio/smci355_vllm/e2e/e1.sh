@@ -22,11 +22,18 @@ ALLN=($(printf '%s\n' "${DN[@]}" "$C" $SOURCES | awk 'NF && !s[$0]++'))
 SPEC_K=${SPEC_K:-7}; CONC=${CONC:-128}; ISL=${ISL:-1024}; OSL=${OSL:-8000}
 WIN=${WIN:-180}; GAP=${GAP:-120}; CYCLES=${CYCLES:-2}; IOTC=${IOTC:-104}; WARM=${WARM:-300}
 OUT=$W/results/e2e/$RUN
+# EPIO_PUSH=<VictoriaMetrics URL>: the run's decode, EP, KV and window metrics go there live under experiment EPIO_EXP
+# (the netmon recordings' experiment), for tools/epio_dash.py's dashboard
+EPIO_EXP=${EPIO_EXP:-${NETMON_EXP_PREFIX:-}$RUN}
 mkdir -p "$OUT/prof" "$OUT/load"
 exec > >(tee -a "$OUT/driver.log") 2>&1
 ctl_ips "${ALLN[@]}"
 echo "=== E1 $RUN job $JOB decode ${DN[*]} (DP${#DN[@]} x TP8 = EP$((8 * ${#DN[@]}))) leader ${CTL[${DN[0]}]}, IO/load C=$C (${CTL[$C]}) IO sources $SOURCES SPEC_K=$SPEC_K CONC=$CONC/DP ISL=$ISL OSL=$OSL targets ${TARGETS:-all} RAIL_ALIGN=${RAIL_ALIGN:-0} $(date -u +%FT%TZ)"
 source "$W/e2e/windows.sh"
+# the nodes push to EPIO_PUSH themselves (loadgen on C, io_inject on the IO nodes, ainic-netmon on every node)
+if [ -n "${EPIO_PUSH:-}" ] && ! hx "$C" "curl -sf -m 5 $EPIO_PUSH/health > /dev/null"; then
+    echo "EPIO_PUSH $EPIO_PUSH is not reachable from $C: the dashboard misses this run's live metrics"
+fi
 PROF_URLS=$(for n in "${DN[@]}"; do printf '%s:8000 ' "$n"; done)
 
 PIDS=()
@@ -40,22 +47,13 @@ cleanup() {
             tee -a "$OUT/dcqcn_restore.log"
     fi
     fab_stop "$OUT" "${ALLN[@]}"
-    [ -n "${NICMON:-}" ] && for n in "${ALLN[@]}"; do
-        hx "$n" "pkill -u \$(id -u) -f '[n]icmon.py --out $OUT/'; for d in /sys/class/infiniband/ionic_*; do echo 10 | sudo -n tee \$d/ports/1/hw_counters/lifespan > /dev/null; done; true"
-    done
+    [ -n "${NETMON:-}" ] && netmon_stop "$OUT" "${ALLN[@]}"
 }
 trap cleanup EXIT
 wait_idle 180 "${ALLN[@]}" || exit 1
 fab_start "$OUT" "${ALLN[@]}"
-# NICMON=1: tools/nicmon.py on every node for the whole run (each NIC's RDMA byte counters, nicmon_<node>.csv.gz; one
-# reader thread per NIC on the last 4 cores). The RDMA core caches the counters for 10 ms (hw_counters/lifespan) and
-# hands out values up to 10 ms stale, so the cache drops to 1 ms for the run and back to 10 in cleanup()
-if [ -n "${NICMON:-}" ]; then
-    for n in "${ALLN[@]}"; do
-        hx "$n" "for d in /sys/class/infiniband/ionic_*; do echo 1 | sudo -n tee \$d/ports/1/hw_counters/lifespan > /dev/null; done
-            nohup taskset -c \$((\$(nproc) - 4))-\$((\$(nproc) - 1)) python3 $W/tools/nicmon.py --out $OUT/nicmon_$n.csv.gz > $OUT/nicmon_$n.log 2>&1 < /dev/null &"
-    done
-fi
+# NETMON=1: ainic-netmon on every node for the whole run (mb/lib.sh netmon_start)
+[ -n "${NETMON:-}" ] && netmon_start "$OUT" "$RUN" "${ALLN[@]}"
 # DCQCN_RULES="prio 0x8 1" [DCQCN_DEFAULT=1]: every port's match_rules (and match_default) for this run, so that its QPs
 # (EP, KV, IO; created from here on) get that DCQCN profile; MoRI's QPs carry SL 0, so only DCQCN_DEFAULT reaches them.
 # cleanup() puts every port back however the run ends (mb/dcqcn_bind.sh, needs sudo on the hosts)
@@ -75,6 +73,8 @@ if [ -n "${PRE_RECV:-}" ]; then
 fi
 
 SX="SPEC_K=$SPEC_K DP_SIZE=${#DN[@]} PROFILE_DIR=$OUT/prof PROFILE_ITERS=${PROFILE_ITERS:-20} RAIL_ALIGN=${RAIL_ALIGN:-0} ${SERVE_ENV:-}"
+# step ticks (SERVE_ENV's YT_STEP_TICK_PORT) to the decode node itself (MKR...g) and to C (MK...g, C writes)
+[[ "${SERVE_ENV:-}" == *YT_STEP_TICK_PORT* ]] && SX="$SX YT_STEP_TICK_HOSTS=127.0.0.1,${CTL[$C]}"
 # a server that exits before every rank is ready (the EP32 e1m_6867: one TP worker of DP0 gone with exit code 255 a
 # second after it was spawned, nothing logged) gets the whole group restarted, SERVE_TRIES (2) times in all; the
 # failed attempt's logs stay as serve_<node>.try<n>.log
@@ -112,8 +112,16 @@ ev serve_ready "$(( $(date +%s) - t0 ))s"
 nw=$(( $(echo ${WINDOWS:-base IRb IWk IRk IWb IWk10} | wc -w) + $(echo ${WINDOWS_ADD-IWk IWk10} | wc -w) ))
 total=$(( WARM + (CYCLES * nw + 1) * (WIN + GAP) + 600 ))
 URLS=$(for n in "${DN[@]}"; do printf 'http://%s:8000,' "${CTL[$n]}"; done)
-PIDS+=("$(cxbg "$C" "$OUT/loadgen.log" "MB_MORI=image bash $W/mb/py.sh $W/e2e/loadgen.py --urls ${URLS%,} --conc $CONC --isl $ISL --osl $OSL --duration $total --out $OUT/load")")
+PUSH=""
+[ -n "${EPIO_PUSH:-}" ] && PUSH="--push $EPIO_PUSH --push-labels experiment=$EPIO_EXP,run=$RUN --url-names $(IFS=,; echo "${DN[*]}")"
+PIDS+=("$(cxbg "$C" "$OUT/loadgen.log" "MB_MORI=image bash $W/mb/py.sh $W/e2e/loadgen.py --urls ${URLS%,} --conc $CONC --isl $ISL --osl $OSL --duration $total $PUSH --out $OUT/load")")
 ev load_start "conc=$CONC/url isl=$ISL osl=$OSL"
+# the nodes' roles (the dashboard's host variables) and the run's settings
+ms=$(date +%s%3N) l="experiment=\"$EPIO_EXP\",run=\"$RUN\"" lines=()
+for n in "${DN[@]}"; do lines+=("epio_node{$l,role=\"decode\",host=\"$n\"} 1 $ms"); done
+for n in $(printf '%s\n' "$C" $SOURCES | awk 'NF && !s[$0]++'); do lines+=("epio_node{$l,role=\"kv_source\",host=\"$n\"} 1 $ms"); done
+lines+=("epio_run_info{$l,ep=\"EP$((8 * ${#DN[@]}))\",conc_per_dp=\"$CONC\",isl=\"$ISL\",osl=\"$OSL\",iotc=\"$IOTC\"} 1 $ms")
+epio_lines "${lines[@]}"
 sleep "$WARM"
 tail -1 "$OUT/load/live.jsonl" 2> /dev/null
 run_windows

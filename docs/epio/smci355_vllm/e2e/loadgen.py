@@ -13,9 +13,13 @@ import asyncio
 import json
 import os
 import random
+import sys
 import time
 
 import aiohttp
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "mb"))
+import vmpush  # noqa: E402
 
 
 class Stats:
@@ -29,14 +33,33 @@ class Stats:
         self.last_err = ""
         self.recent_gaps = []
         self.inflight = {}
+        # --push: per URL, the gaps, finished requests and open streams since the last push
+        self.url_gaps = {}
+        self.url_done = {}
+        self.url_open = {}
 
     def write_req(self, rec):
         self.reqs.write(json.dumps(rec) + "\n")
         self.reqs.flush()
 
 
+PREFIXES = []
+
+
+def prefixes(args):
+    """--prefixes fixed prompts of --prefix-len token ids (the same in every worker): a request starts with one of them
+    and the prefill's prefix cache holds them, so it computes only the rest while the decode receives the whole KV"""
+    if not PREFIXES and args.prefix_len > 0:
+        for k in range(args.prefixes):
+            r = random.Random(args.seed * 7919 + k)
+            PREFIXES.append([r.randrange(1000, 150000) for _ in range(args.prefix_len)])
+    return PREFIXES
+
+
 async def one_stream(session, url, args, stats, rnd, wid):
-    ids = [rnd.randrange(1000, 150000) for _ in range(args.isl)]
+    pre = prefixes(args)
+    head = pre[rnd.randrange(len(pre))] if pre else []
+    ids = head + [rnd.randrange(1000, 150000) for _ in range(max(1, args.isl - len(head)))]
     # output lengths spread over osl * (1 -+ jitter): streams that started together do not all finish together
     osl = max(16, int(args.osl * (1 + args.osl_jitter * (2 * rnd.random() - 1))))
     body = {"model": args.model, "prompt": ids, "max_tokens": osl, "ignore_eos": True, "stream": True,
@@ -45,6 +68,7 @@ async def one_stream(session, url, args, stats, rnd, wid):
     key = id(rec)
     stats.inflight[key] = rec
     stats.open_streams += 1
+    stats.url_open[url] = stats.url_open.get(url, 0) + 1
     last = None
     try:
         async with session.post(url + "/v1/completions", json=body) as r:
@@ -61,10 +85,12 @@ async def one_stream(session, url, args, stats, rnd, wid):
                     rec["t_first"] = t
                 else:
                     stats.recent_gaps.append(t - last)
+                    stats.url_gaps.setdefault(url, []).append(t - last)
                 rec["chunks"].append(round(t - rec["t0"], 4))
                 last = t
         rec["done"] = True
         stats.ok += 1
+        stats.url_done[url] = stats.url_done.get(url, 0) + 1
     except Exception as e:  # noqa: BLE001
         stats.err += 1
         stats.last_err = str(e)[:300]
@@ -72,6 +98,7 @@ async def one_stream(session, url, args, stats, rnd, wid):
         await asyncio.sleep(1)
     finally:
         stats.open_streams -= 1
+        stats.url_open[url] -= 1
         stats.inflight.pop(key, None)
         rec["t_end"] = time.time()
         stats.write_req(rec)
@@ -95,6 +122,23 @@ async def reporter(stats, until):
         stats.live.flush()
 
 
+async def pusher_loop(stats, pusher, names, until):
+    """--push, every second per decode server: the step time (gap between consecutive chunks of a stream) p50 / p90 /
+    p99, the chunks (sequence-steps) per second, the finished requests per second and the open streams"""
+    while time.time() < until:
+        await asyncio.sleep(1)
+        t = time.time()
+        for url, name in names.items():
+            g = sorted(stats.url_gaps.pop(url, []))
+            if g:
+                for q in (50, 90, 99):
+                    pusher.add("epio_decode_step_ms", 1e3 * g[min(len(g) - 1, len(g) * q // 100)], ts=t, server=name,
+                               q=f"p{q}")
+            pusher.add("epio_decode_chunks_per_s", len(g), ts=t, server=name)
+            pusher.add("epio_decode_done_per_s", stats.url_done.pop(url, 0), ts=t, server=name)
+            pusher.add("epio_decode_streams", stats.url_open.get(url, 0), ts=t, server=name)
+
+
 async def main_async(args):
     os.makedirs(args.out, exist_ok=True)
     stats = Stats(args.out)
@@ -112,6 +156,10 @@ async def main_async(args):
             if args.ramp_s:
                 await asyncio.sleep(args.ramp_s / args.conc)
         rep = asyncio.create_task(reporter(stats, until + 5))
+        pusher = vmpush.from_args(args.push, args.push_labels)
+        if pusher:
+            names = dict(zip(urls, (args.url_names.split(",") if args.url_names else urls)))
+            pus = asyncio.create_task(pusher_loop(stats, pusher, names, until + 5))
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         for sig in ("SIGINT", "SIGTERM"):
@@ -123,6 +171,9 @@ async def main_async(args):
         for t in tasks:
             t.cancel()
         rep.cancel()
+        if pusher:
+            pus.cancel()
+            pusher.close()
         for rec in list(stats.inflight.values()):
             rec["t_end"] = time.time()
             stats.write_req(rec)
@@ -135,12 +186,17 @@ def main():
     ap.add_argument("--model", default="moonshotai/Kimi-K3.1-Pro")
     ap.add_argument("--conc", type=int, default=128, help="streams per URL")
     ap.add_argument("--isl", type=int, default=1024)
+    ap.add_argument("--prefix-len", type=int, default=0, help="tokens of the prompt taken from a shared prefix")
+    ap.add_argument("--prefixes", type=int, default=4, help="distinct shared prefixes (with --prefix-len)")
     ap.add_argument("--osl", type=int, default=8000)
     ap.add_argument("--osl-jitter", type=float, default=0.5, help="output length uniform in osl * (1 -+ jitter)")
     ap.add_argument("--duration", type=float, default=3600)
     ap.add_argument("--ramp-s", type=float, default=60, help="spread the stream starts over this many seconds")
     ap.add_argument("--read-timeout", type=float, default=900)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--push", default="", help="VictoriaMetrics URL for per-second decode metrics (mb/vmpush.py)")
+    ap.add_argument("--push-labels", default="", help="with --push: k=v,k=v labels (experiment, run)")
+    ap.add_argument("--url-names", default="", help="with --push: a name per --urls entry (the server label)")
     ap.add_argument("--out", required=True)
     asyncio.run(main_async(ap.parse_args()))
 

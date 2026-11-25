@@ -3,8 +3,9 @@
 # Every step runs in the node's named pyxis container (k31-ms vLLM image, created on first use, kept for the job);
 # everything writes straight to NFS under $W.
 W=/apps/yutongwu/store-vllm/k31-vllm-ep-io-smci355-20261119
-SQSH=/apps/yutongwu/store-vllm/k31-umbp-20261112/images/yukiozzz_vllm-openai-rocm_k31-ms-1114.sqsh
-CNAME=yutongwu-epio
+# SQSH / CNAME: the image and the pyxis container of the steps (e2e/e1sgl.sh sets its SGLang ones)
+SQSH=${SQSH:-/apps/yutongwu/store-vllm/k31-umbp-20261112/images/yukiozzz_vllm-openai-rocm_k31-ms-1114.sqsh}
+CNAME=${CNAME:-yutongwu-epio}
 IONIC=/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so
 # /etc/slurm: slurmstepd runs the TaskProlog (/etc/slurm/task_prolog.sh) inside the container
 MOUNTS="/apps:/apps,/etc/slurm:/etc/slurm,/dev/kfd:/dev/kfd,/dev/dri:/dev/dri,/dev/infiniband:/dev/infiniband,$IONIC:$IONIC:ro,/data/models:/data/models:ro,/perf_apps/data/models:/perf_apps/data/models:ro"
@@ -140,7 +141,10 @@ inj_prerecv() {
 }
 inj_start() {
     local od=$1 iotc=$2 op=$3 ini=$4 pas=$5; shift 5
-    local pb=$((32000 + (INJ_SEQ % 40) * 20)) sargs="$*"
+    local pb=$((32000 + (INJ_SEQ % 40) * 20)) sargs="$*" tgt=$pas src=$ini
+    [ "$op" = read ] && { tgt=$ini; src=$pas; }
+    # EPIO_PUSH: each KV transfer's time to the experiment's dashboard (io_inject.py --push; e2e/windows.sh EPIO_WIN)
+    [ -n "${EPIO_PUSH:-}" ] && sargs="$sargs --push $EPIO_PUSH --push-labels experiment=${EPIO_EXP:-${RUN:-}},run=${RUN:-},window=${EPIO_WIN:-},tc=$iotc,op=$op,target=$tgt,source=$src"
     INJ_SEQ=$((INJ_SEQ + 1))
     mkdir -p "$od/inj"
     if [ -n "${INJ_PRE[$pas]:-}" ] && [ -z "${INJ_NOPRE:-}" ] && [ "$op" = write ]; then
@@ -150,6 +154,28 @@ inj_start() {
         sleep 20
     fi
     INJ_PIDS+=("$(cxbg "$ini" "$od/inj/send.log" "MB_MORI=pr996 IOTC=$iotc bash $W/mb/py.sh $W/mb/io_inject.py send --op $op --peer ${CTL[$pas]} --devs 0-7 --port-base $pb ${INJ_IMEM:---mem gpu} --buf-gb ${INJ_BUF_GB:-1} $sargs --out $od/inj/send")")
+}
+# netmon_start <outdir> <experiment> <nodes...>: ainic-netmon (ROCm/mori PR #1000, tools/netmon_bin) on each node, on the
+# host and unprivileged (RDMA netlink counters of every NIC every 2 ms, ethtool every 1 s: NETMON_INTERVAL), into
+# <outdir>/netmon/<node> (~6.7 GB per node and hour at 2 ms). netmon_stop <outdir> <nodes...> ends them with SIGTERM
+# (the recorder then finishes its files and marks the run complete).
+# NETMON_PUSH=<VictoriaMetrics URL>: also push live (key counters, every 1 s) under experiment ${NETMON_EXP_PREFIX}<exp>,
+# e.g. ditian12's netmon stack http://10.235.192.132:38428 (Grafana http://10.235.192.132/). Points the push drops are
+# only in the recording: re-import it afterwards (tools/netmon_report/ainic_netmon_import.py --replace).
+netmon_start() {
+    local od=$1 exp=$2 n; shift 2
+    mkdir -p "$od/netmon"
+    for n in "$@"; do
+        hx "$n" "nohup $W/tools/netmon_bin/ainic-netmon record -o $od/netmon/$n --host-id $n \
+            --experiment ${NETMON_EXP_PREFIX:-}$exp --interval ${NETMON_INTERVAL:-rdma=2ms,ethtool=1s} -d 86400s -q \
+            ${NETMON_PUSH:+--push $NETMON_PUSH --grafana ${NETMON_GRAFANA:-http://10.235.192.132}} \
+            > $od/netmon_$n.log 2>&1 < /dev/null &"
+    done
+}
+netmon_stop() {
+    local od=$1 n; shift
+    for n in "$@"; do hx "$n" "pkill -TERM -u \$(id -u) -f '[a]inic-netmon record -o $od/netmon/'; true"; done
+    sleep 3
 }
 # dcqcn_show <outdir> <tag> <nodes...>: mb/dcqcn_bind.sh show on each node at once (the DCQCN profile the QPs got, the
 # firmware's DCQCN state of the RC QPs); <outdir>/<tag>_<node>.txt, nicctl's JSON beside it

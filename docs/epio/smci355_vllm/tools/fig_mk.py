@@ -19,6 +19,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mk_analyze as mk  # noqa: E402
 from nicmon_load import load, native, rates  # noqa: E402
+import netmon_read as nr  # noqa: E402
 
 
 def dark():
@@ -31,13 +32,23 @@ def dark():
 
 def traffic(a):
     plt = dark()
-    ws = {w[0]: w for w in mk.windows(a.run_dir)}
-    _, t0, t1, _, _ = ws[a.window]
-    S, _, _ = load(os.path.join(a.run_dir, f"nicmon_{a.node}.csv.gz"))
+    if a.window == "nat":  # a P/D run's natural stretch
+        ev = {tuple(l.rstrip("\n").split("\t")[1:3]): float(l.split("\t")[0]) for l in open(os.path.join(a.run_dir, "events.tsv"))
+              if l.count("\t") >= 2}
+        t0, t1 = ev[("nat", "start")], ev[("nat", "end")]
+    else:
+        ws = {w[0]: w for w in mk.windows(a.run_dir)}
+        _, t0, t1, _, _ = ws[a.window]
+    netmon = nr.runs(a.run_dir).get(a.node)
+    S = None if netmon else load(os.path.join(a.run_dir, f"nicmon_{a.node}.csv.gz"))[0]
     b = a.bin_ms / 1e3
     fig, ax = plt.subplots(2, 2, figsize=(16, 7.5))
-    nat = native(S)
-    how = f"{a.bin_ms:g} ms bins" if b > 0 else "between consecutive reads"
+    if netmon:  # ainic-netmon: each point one sampling interval of the recorder (~2 ms)
+        nat = [(t, x, y) for _, t, x, y in nr.gbps_pair(netmon)]
+        b = 0.0
+    else:
+        nat = native(S)
+    how = f"{a.bin_ms:g} ms bins" if b > 0 else ("per ainic-netmon interval" if netmon else "between consecutive reads")
     for row, (s, e) in enumerate(((t0, min(t1, t0 + 60)), (t0 + a.zoom_at, t0 + a.zoom_at + a.zoom_s))):
         if b > 0:
             g = np.arange(s, e, b)

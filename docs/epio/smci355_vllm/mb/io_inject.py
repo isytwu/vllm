@@ -332,9 +332,108 @@ def _wait_until(t_at, stop):
     return False
 
 
+def _kv_push(pusher, dev, arrive, start, done, mb):
+    """--push: one KV transfer to the experiment's dashboard: its time (start -> done), its latency (arrival -> done,
+    the wait for the previous transfer or the next decode step included) and its MB on this NIC"""
+    if pusher:
+        pusher.add("epio_kv_ms", (done - start) * 1e3, ts=done, kind="transfer", dev=dev)
+        pusher.add("epio_kv_ms", (done - arrive) * 1e3, ts=done, kind="latency", dev=dev)
+        pusher.add("epio_kv_mb", mb, ts=done, dev=dev)
+
+
+def _kv_gated(dev, args, out_q, stop, sock, eng, xfer, chunk, cbytes, ok):
+    """--gate-port: KV only right after the decode starts a step (UDP from e2e/step_tick_patch.py on 127.0.0.1:
+    --gate-port + dev), at most --gate-mb per NIC per step, posted at once; what is left waits for the next step.
+    Transfers arrive as in _kv_sender (kv_schedule) and queue first come first served."""
+    import collections
+
+    import numpy as np
+
+    import vmpush
+
+    pusher = vmpush.from_args(args.push, args.push_labels)
+    nchunks = max(1, round(args.kv_mb * (1 << 20) / cbytes))
+    budget = max(1, round(args.gate_mb * (1 << 20) / cbytes))
+    g = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    g.bind((args.gate_bind, args.gate_port + dev))
+    sched = collections.deque(kv_schedule(args, dev))
+    queue = collections.deque()  # [arrival, chunks left, start]
+    kv_a, kv_s, kv_d, t_sub, t_done, used = [], [], [], [], [], []
+    ticks = 0
+    c = 0
+    t0 = time.time()
+    while not stop.is_set() and time.time() - t0 < args.duration:
+        g.settimeout(0.2)
+        try:
+            g.recv(16)
+        except socket.timeout:
+            continue
+        tt = time.time()
+        g.setblocking(False)
+        try:  # ticks that queued up while the previous batch ran are stale: the newest step start only
+            while True:
+                g.recv(16)
+        except BlockingIOError:
+            pass
+        ticks += 1
+        while sched and t0 + sched[0] <= tt:
+            queue.append([t0 + sched.popleft(), nchunks, None])
+        if not queue:
+            continue
+        left, posted, finished = budget, [], []
+        while left and queue:
+            tr = queue[0]
+            if tr[2] is None:
+                tr[2] = tt
+            k = min(left, tr[1])
+            for _ in range(k):
+                posted.append((time.time(), xfer(*chunk(c), [eng.allocate_transfer_uid()])))
+                c += 1
+            tr[1] -= k
+            left -= k
+            if tr[1] == 0:
+                finished.append(queue.popleft())
+        for ts0, st0 in posted:
+            rc = eng.wait_all(st0)
+            t_sub.append(ts0); t_done.append(time.time())
+            if rc != ok:
+                out_q.put((dev, {"error": f"transfer failed rc={rc}"}))
+                return
+        td = time.time()
+        used.append((tt, len(posted), td - tt))
+        for tr in finished:
+            kv_a.append(tr[0]); kv_s.append(tr[2]); kv_d.append(td)
+            _kv_push(pusher, dev, tr[0], tr[2], td, nchunks * cbytes / (1 << 20))
+    t1 = time.time()
+    if pusher:
+        pusher.close()
+    send_msg(sock, "done")
+    sock.close()
+    kv_a, kv_s, kv_d = np.array(kv_a), np.array(kv_s), np.array(kv_d)
+    kvb = np.full(kv_a.size, nchunks * cbytes)
+    dur, lat = (kv_d - kv_s) * 1e3, (kv_d - kv_a) * 1e3
+    busy = np.array([u[2] for u in used]) * 1e3
+    pct = lambda x, q: float(np.percentile(x, q)) if x.size else None  # noqa: E731
+    out_q.put((dev, dict(kv_transfers=int(kv_a.size), gbps=float(kvb.sum() / (t1 - t0) / 1e9),
+                         kv_ms_p50=pct(dur, 50), kv_ms_p99=pct(dur, 99), kv_lat_ms_p50=pct(lat, 50),
+                         kv_lat_ms_p99=pct(lat, 99), ticks=ticks, steps_used=len(used),
+                         step_batch_ms_p50=pct(busy, 50), step_batch_ms_p99=pct(busy, 99), queued_at_end=len(queue))))
+    os.makedirs(args.out, exist_ok=True)
+    np.savez(os.path.join(args.out, f"io_dev{dev}.npz"), t_submit=np.array(t_sub), t_done=np.array(t_done),
+             bytes=np.full(len(t_sub), cbytes), kv_arrive=kv_a, kv_start=kv_s, kv_done=kv_d, kv_bytes=kvb,
+             gate_tick=np.array([u[0] for u in used]), gate_chunks=np.array([u[1] for u in used]),
+             gate_busy_s=np.array([u[2] for u in used]),
+             meta=json.dumps({"dev": dev, "args": vars(args), "host": socket.gethostname(), "ticks": ticks}))
+
+
 def _kv_sender(dev, args, out_q, stop, sock, eng, xfer, chunk, cbytes, ok):
     import numpy as np
 
+    if args.gate_port:
+        return _kv_gated(dev, args, out_q, stop, sock, eng, xfer, chunk, cbytes, ok)
+    import vmpush
+
+    pusher = vmpush.from_args(args.push, args.push_labels)
     nchunks = max(1, round(args.kv_mb * (1 << 20) / cbytes))
     gap = cbytes / (args.pace_gbps * 1e9) if args.pace_gbps > 0 else 0.0
     t0 = time.time()
@@ -363,9 +462,12 @@ def _kv_sender(dev, args, out_q, stop, sock, eng, xfer, chunk, cbytes, ok):
             eng.wait_all(st0)
             t_sub.append(ts0); t_done.append(time.time())
         kv_a.append(t0 + off); kv_s.append(ts_start); kv_d.append(time.time())
+        _kv_push(pusher, dev, kv_a[-1], ts_start, kv_d[-1], nchunks * cbytes / (1 << 20))
         if stop.is_set():
             break
     t1 = time.time()
+    if pusher:
+        pusher.close()
     send_msg(sock, "done")
     sock.close()
     kv_a, kv_s, kv_d = np.array(kv_a), np.array(kv_s), np.array(kv_d)
@@ -412,6 +514,13 @@ def main():
     ap.add_argument("--kv-shared", action="store_true",
                     help="KV mode: the schedule from --kv-seed alone, the same in every sender (sources burst together)")
     ap.add_argument("--pace-gbps", type=float, default=0.0, help="KV mode: cap per NIC within a transfer (0 = none)")
+    ap.add_argument("--gate-port", type=int, default=0,
+                    help="KV mode: move KV only as the decode starts a step (its step ticks on 127.0.0.1:port+dev)")
+    ap.add_argument("--gate-mb", type=float, default=256, help="KV mode with --gate-port: MB per NIC per step")
+    ap.add_argument("--gate-bind", default="127.0.0.1",
+                    help="with --gate-port: where the ticks arrive (0.0.0.0 on a source the decode sends them to)")
+    ap.add_argument("--push", default="", help="KV mode: VictoriaMetrics URL for each transfer's time (mb/vmpush.py)")
+    ap.add_argument("--push-labels", default="", help="with --push: k=v,k=v labels (experiment, window, ...)")
     ap.add_argument("--accept-timeout", type=float, default=600)
     ap.add_argument("--serve-forever", action="store_true")
     ap.add_argument("--out", default="/tmp/io_inject")

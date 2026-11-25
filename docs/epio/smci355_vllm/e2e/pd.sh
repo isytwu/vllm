@@ -2,6 +2,7 @@
 # Runs on the LOGIN node:  JOB=<holder> PREFILL="<node> ..." DECODE="<node> <node> ..." C=<node> RUN=<name>
 #                          [KVTC=104] [CONC=128] [DUR=2700] [NAT_S=1200] [WINDOWS="IWk IRk ..."] [WIN=120] [GAP=60]
 #                          [SERVE_ENV="VAR=.."] [PSERVE_ENV="VAR=.."] [CLIENT=loadgen ISL=8192 OSL=2048 WARM=300]
+#                          [KVMODE=read|write] [KV_ENV="MORI_IO_..=.."] [PREFIX_LEN=0 PREFIXES=4] [NETMON=1] [NAT_PROF=1]
 #                          bash e2e/pd.sh
 # P/D under the AgentX workload. Every PREFILL node serves the colleague's prefill (TP8 DCP8, port 8100); the DECODE
 # nodes serve E1's wide-EP decode (DP x TP8, one rank per node, MoRI all2all, port 8000). The KV moves with vLLM's
@@ -18,16 +19,19 @@ set -uo pipefail
 source "$(dirname "$0")/../mb/lib.sh"
 : "${JOB:?}" "${C:?}" "${RUN:?}" "${PREFILL:?}" "${DECODE:?}"
 PN=($PREFILL) DN=($DECODE)
-KVTC=${KVTC:-104}; CONC=${CONC:-128}; DUR=${DUR:-2700}; NAT_S=${NAT_S:-1200}
+KVTC=${KVTC:-104}; CONC=${CONC:-128}; DUR=${DUR:-2700}; NAT_S=${NAT_S:-1200}; KVMODE=${KVMODE:-read}
 WIN=${WIN:-120}; GAP=${GAP:-60}; CYCLES=1; IOTC=${IOTC:-104}
 AGX=$W/agentx
 OUT=$W/results/e2e/$RUN
+# EPIO_PUSH=<VictoriaMetrics URL>: the proxy's decode and PD metrics, the windows and the EP captures go there live
+# under experiment EPIO_EXP (the netmon recordings' experiment), for tools/epio_dash.py's dashboard
+EPIO_EXP=${EPIO_EXP:-${NETMON_EXP_PREFIX:-}$RUN}
 mkdir -p "$OUT/prof" "$OUT/load"
 exec > >(tee -a "$OUT/driver.log") 2>&1
 ctl_ips "${PN[@]}" "${DN[@]}" "$C"
 # every node once: C can be a prefill node too (no IO node; the proxy and the client only use its CPUs)
 ALL=($(printf '%s\n' "${PN[@]}" "${DN[@]}" "$C" | awk '!seen[$0]++'))
-echo "=== PD $RUN job $JOB prefill ${PN[*]} decode ${DN[*]} (DP${#DN[@]} x TP8 = EP$((8 * ${#DN[@]}))) C=$C MoRIIO READ, KV in TC $KVTC, AgentX conc $CONC dur ${DUR}s nat ${NAT_S}s RAIL_ALIGN=${RAIL_ALIGN:-0} $(date -u +%FT%TZ)"
+echo "=== PD $RUN job $JOB prefill ${PN[*]} decode ${DN[*]} (DP${#DN[@]} x TP8 = EP$((8 * ${#DN[@]}))) C=$C MoRIIO $KVMODE, KV in TC $KVTC, KV_ENV=${KV_ENV:-}, AgentX conc $CONC dur ${DUR}s nat ${NAT_S}s RAIL_ALIGN=${RAIL_ALIGN:-0} $(date -u +%FT%TZ)"
 source "$W/e2e/windows.sh"
 PROF_URLS=$(for n in "${DN[@]}"; do printf '%s:8000 ' "$n"; done)
 
@@ -42,10 +46,14 @@ cleanup() {
         hx "$n" "pkill -u \$(id -u) -f '[v]llm serve|[V]LLM::|[p]d_proxy.py|[a]gentx profile|[a]iperf|[i]o_inject.py'; true"
     done
     fab_stop "$OUT" "${ALL[@]}"
+    [ -n "${NETMON:-}" ] && netmon_stop "$OUT" "${ALL[@]}"
 }
 trap cleanup EXIT
 wait_idle 180 "${ALL[@]}" || exit 1
 fab_start "$OUT" "${ALL[@]}"
+# NETMON=1: ainic-netmon on every node for the whole run (mb/lib.sh netmon_start); NETMON=nat: only around the natural
+# stretch (2 ms recordings of a whole run are too big to import into the shared netmon stack)
+[ "${NETMON:-}" = 1 ] && netmon_start "$OUT" "$RUN" "${ALL[@]}"
 # PRE_RECV=1: the IO windows' write receivers come up on the targets before the decode does (mb/lib.sh inj_prerecv)
 if [ -n "${PRE_RECV:-}" ]; then
     inj_prerecv "$OUT/prerecv" "$IOTC" ${TARGETS:-$DECODE}
@@ -56,11 +64,15 @@ fi
 # kvcfg <role> <node> <http port> <port base>: the MoRIIO config of one server. The connector needs its HTTP port,
 # a handshake port and a notify port (it adds the DP / TP rank offsets) and the address it advertises (the control
 # network's, the one the proxy uses); srtctl filled these in for the E2 runs
+# KVMODE=write: the prefill RDMA-writes the KV into the decode's blocks (pd_proxy.py --mode write sends both legs at
+# once); read (default): the decode RDMA-reads it, and waits for it before the step's forward
 kvcfg() {
-    printf '{"kv_connector":"MoRIIOConnector","kv_role":"%s","kv_load_failure_policy":"fail","kv_connector_extra_config":{"backend":"rdma","read_mode":true,"defer_timeout":600,"host_ip":"%s","http_port":"%s","handshake_port":"%s","notify_port":"%s"}}' \
-        "$1" "${CTL[$2]}" "$3" "$4" "$(( $4 + 1000 ))"
+    local rm=true; [ "$KVMODE" = write ] && rm=false
+    printf '{"kv_connector":"MoRIIOConnector","kv_role":"%s","kv_load_failure_policy":"fail","kv_connector_extra_config":{"backend":"rdma","read_mode":%s,"defer_timeout":600,"host_ip":"%s","http_port":"%s","handshake_port":"%s","notify_port":"%s"}}' \
+        "$1" "$rm" "${CTL[$2]}" "$3" "$4" "$(( $4 + 1000 ))"
 }
-SX="SPEC_K=${SPEC_K:-7} DP_SIZE=${#DN[@]} PROFILE_DIR=$OUT/prof PROFILE_ITERS=${PROFILE_ITERS:-20} RAIL_ALIGN=${RAIL_ALIGN:-0} KV_TC=$KVTC ${SERVE_ENV:-}"
+# KV_ENV: mori io settings for both sides (e.g. MORI_IO_ENABLE_CHUNKING=1 MORI_IO_CHUNK_BYTES=.. MORI_IO_QP_MAX_SEND_WR=..)
+SX="SPEC_K=${SPEC_K:-7} DP_SIZE=${#DN[@]} PROFILE_DIR=$OUT/prof PROFILE_ITERS=${PROFILE_ITERS:-20} RAIL_ALIGN=${RAIL_ALIGN:-0} KV_TC=$KVTC ${KV_ENV:-} ${SERVE_ENV:-}"
 # as in e1.sh: a server that exits before all are ready gets the whole group restarted, SERVE_TRIES (2) times in all
 for try in $(seq 1 "${SERVE_TRIES:-2}"); do
     ev serve_start "KV TC $KVTC, try $try"
@@ -70,7 +82,7 @@ for try in $(seq 1 "${SERVE_TRIES:-2}"); do
     done
     for n in "${PN[@]}"; do
         # fcfs: shortest-prefill-first needs the SimpleCPUOffloadConnector in this build
-        SPIDS+=("$(cxbg "$n" "$OUT/prefill_$n.log" "env RAIL_ALIGN=${RAIL_ALIGN:-0} KV_TC=$KVTC P_SCHED=fcfs ${PSERVE_ENV:-} KV_CFG='$(kvcfg kv_producer "$n" 8100 26000)' bash $W/e2e/serve.sh prefill 0 - 8100")")
+        SPIDS+=("$(cxbg "$n" "$OUT/prefill_$n.log" "env RAIL_ALIGN=${RAIL_ALIGN:-0} KV_TC=$KVTC P_SCHED=fcfs ${KV_ENV:-} ${PSERVE_ENV:-} KV_CFG='$(kvcfg kv_producer "$n" 8100 26000)' bash $W/e2e/serve.sh prefill 0 - 8100")")
     done
     PIDS+=("${SPIDS[@]}")
     t0=$(date +%s) up=0
@@ -98,7 +110,16 @@ ev serve_ready "$(( $(date +%s) - t0 ))s"
 
 PURL=$(for n in "${PN[@]}"; do printf -- '--prefill http://%s:8100 ' "${CTL[$n]}"; done)
 DURL=$(for n in "${DN[@]}"; do printf -- '--decode http://%s:8000 ' "${CTL[$n]}"; done)
-PIDS+=("$(cxbg "$C" "$OUT/proxy.log" "$AGX/venv/bin/python $W/e2e/pd_proxy.py $PURL $DURL --port 8000 --out $OUT/load")")
+PUSH=""
+if [ -n "${EPIO_PUSH:-}" ]; then
+    PUSH="--push $EPIO_PUSH --push-labels experiment=$EPIO_EXP,run=$RUN --decode-names $(IFS=,; echo "${DN[*]}")"
+    ms=$(date +%s%3N) l="experiment=\"$EPIO_EXP\",run=\"$RUN\"" lines=()
+    for n in "${DN[@]}"; do lines+=("epio_node{$l,role=\"decode\",host=\"$n\"} 1 $ms"); done
+    for n in "${PN[@]}"; do lines+=("epio_node{$l,role=\"prefill\",host=\"$n\"} 1 $ms"); done
+    lines+=("epio_run_info{$l,ep=\"EP$((8 * ${#DN[@]}))\",kv_mode=\"$KVMODE\",kv_tc=\"$KVTC\",kv_env=\"${KV_ENV:-}\",conc=\"$CONC\"} 1 $ms")
+    epio_lines "${lines[@]}"
+fi
+PIDS+=("$(cxbg "$C" "$OUT/proxy.log" "$AGX/venv/bin/python $W/e2e/pd_proxy.py $PURL $DURL --mode $KVMODE --port 8000 $PUSH --out $OUT/load")")
 for i in $(seq 30); do hx "$C" "curl -sf -m 5 http://127.0.0.1:8000/health > /dev/null" && break; sleep 2; done
 # one request through both legs before the client starts: the first READ sets up the MoRIIO sessions
 hx "$C" "curl -s -m 600 http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\":\"moonshotai/Kimi-K3.1-Pro\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hello in one word.\"}],\"max_tokens\":8}'" | head -c 600
@@ -113,8 +134,8 @@ if [ "${CLIENT:-agentx}" = loadgen ]; then
     ISL=${ISL:-8192}; OSL=${OSL:-2048}
     nw=$( [ "${WINDOWS:-}" = none ] && echo 0 || echo ${WINDOWS:-x x x x x x} | wc -w)
     total=$(( ${WARM:-300} + NAT_S + (nw + 1) * (WIN + GAP) + 600 ))
-    PIDS+=("$(cxbg "$C" "$OUT/loadgen.log" "MB_MORI=image bash $W/mb/py.sh $W/e2e/loadgen.py --urls http://127.0.0.1:8000 --conc $CONC --isl $ISL --osl $OSL --duration $total --out $OUT/client")")
-    ev load_start "conc=$CONC isl=$ISL osl=$OSL"
+    PIDS+=("$(cxbg "$C" "$OUT/loadgen.log" "MB_MORI=image bash $W/mb/py.sh $W/e2e/loadgen.py --urls http://127.0.0.1:8000 --conc $CONC --isl $ISL --osl $OSL --osl-jitter ${OSL_JITTER:-0.5} --prefix-len ${PREFIX_LEN:-0} --prefixes ${PREFIXES:-4} --duration $total --out $OUT/client")")
+    ev load_start "conc=$CONC isl=$ISL osl=$OSL prefix ${PREFIX_LEN:-0} x ${PREFIXES:-4}"
     sleep "${WARM:-300}"
     ev measure_start "${WARM:-300}s of ramp"
 else
@@ -133,9 +154,16 @@ else
     done
     ev measure_start "$(( $(date +%s) - t0 ))s of warmup"
 fi
+[ "${NETMON:-}" = nat ] && { netmon_start "$OUT" "$RUN" "${ALL[@]}"; sleep 10; }
 ev nat start
-sleep "$NAT_S"
+# NAT_PROF=1: one torch-profiler capture on the decode servers in the middle of the natural stretch
+if [ -n "${NAT_PROF:-}" ]; then
+    sleep $(( NAT_S / 2 )); profile nat_1; sleep $(( NAT_S - NAT_S / 2 - ${PROFILE_S:-8} ))
+else
+    sleep "$NAT_S"
+fi
 ev nat end
+[ "${NETMON:-}" = nat ] && { sleep 10; netmon_stop "$OUT" "${ALL[@]}"; }
 tail -1 "$OUT/load/live.jsonl" 2> /dev/null
 if [ "${WINDOWS:-}" != none ]; then
     WINDOWS_ADD="${WINDOWS_ADD-}" run_windows
