@@ -5,12 +5,12 @@
 
 Per window (IO on = events <w>_io_on - 20 s .. <w>_io_end; base = the base windows):
   step     the loadgen's median gap between streamed chunks (one decode step), vs the base windows
-  EP       decode TX per NIC: mean, and p50 / p99 of the 10 ms bins (decode nodes send only EP and READ requests)
+  EP       decode TX per NIC: mean, and p50 / p99 of the bins (decode nodes send only EP and READ requests)
   KV       io_inject: transfers, duration p50 / p99 (start to done), latency p50 / p99 (arrival to done, with the wait
-           for the previous transfer), rate per NIC while transferring; decode RX 10 ms bins p99 / max
+           for the previous transfer), rate per NIC while transferring; decode RX bins p99 / max
   loss     retransmitted packets / s at the senders, sequence errors / s at the receivers (TC 0 drops)
   CNP      CNPs / s at the decode nodes (EP packets marked in a switch queue)
-Plots: Moonshot-style 10 ms per-NIC RX / TX of the first decode node, an overview of the window and a zoom.
+Plots: Moonshot-style per-NIC RX / TX (--bin-ms bins, default 5) of the first decode node, an overview of the window and a zoom.
 """
 import argparse
 import glob
@@ -25,12 +25,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from nicmon_load import SLOW, load as load_nicmon, rates  # noqa: E402
 
 
-def bins(tn, fv, t0, t1, b=0.01):
-    """Gb/s per NIC on 10 ms bins in [t0, t1): (tx [n, 8], rx [n, 8], bin starts)"""
-    grid = np.arange(t0, t1, b)
-    if len(tn) < 2 or len(grid) < 2:
+BIN = 0.005
+
+
+def bins(series, t0, t1, b=None):
+    """Gb/s per NIC on BIN-second bins in [t0, t1): (tx [n, 8], rx [n, 8], bin starts)"""
+    grid = np.arange(t0, t1, b or BIN)
+    if len(grid) < 2 or not any(len(s[0]) > 1 for s in series):
         return None, None, grid
-    tx, rx = rates(tn, fv, grid)
+    tx, rx = rates(series, grid)
     return tx, rx, grid[:-1]
 
 
@@ -121,8 +124,8 @@ def plot(path, title, t, tx, rx, nic_line=400):
     for i in range(rx.shape[1]):
         ax[0].plot(x, rx[:, i], lw=0.8, label=f"ionic_{i}")
         ax[1].plot(x, tx[:, i], lw=0.8, label=f"ionic_{i}")
-    ax[0].set_title(f"{title}: port_rcv_data (Gb/s, 10 ms)")
-    ax[1].set_title(f"{title}: port_xmit_data (Gb/s, 10 ms)")
+    ax[0].set_title(f"{title}: port_rcv_data (Gb/s, {BIN * 1e3:g} ms)")
+    ax[1].set_title(f"{title}: port_xmit_data (Gb/s, {BIN * 1e3:g} ms)")
     for a in ax:
         a.set_xlabel("s"); a.grid(alpha=0.2); a.set_ylim(bottom=0)
     ax[0].axhline(nic_line, color="w", lw=0.5, ls=":")
@@ -137,8 +140,11 @@ def main():
     ap.add_argument("run_dir")
     ap.add_argument("--plots")
     ap.add_argument("--zoom-s", type=float, default=0.8)
+    ap.add_argument("--bin-ms", type=float, default=5.0)
     ap.add_argument("--decode", default=None, help="decode nodes (default: the serve_<node>.log ones)")
     a = ap.parse_args()
+    global BIN
+    BIN = a.bin_ms / 1e3
     rd = a.run_dir
     dec = a.decode.split() if a.decode else sorted(re.sub(r"^serve_|\.log$", "", os.path.basename(f))
                                                   for f in glob.glob(os.path.join(rd, "serve_*.log")) if "try" not in f)
@@ -151,8 +157,8 @@ def main():
     b0 = float(np.nanmean(base)) if base else float("nan")
     print(f"run {os.path.basename(os.path.normpath(rd))}: decode {dec}, IO source {src}, base windows' step "
           f"{' / '.join(f'{x:.1f}' for x in base)} ms")
-    hdr = ("| window | step (ms) | IO off around it (ms) | change | EP TX / NIC mean (Gb/s) | EP 10 ms p50 / p99 "
-           "| decode RX 10 ms p99 / max | KV transfers | KV ms p50 / p99 | KV latency ms p50 / p99 | KV GB/s / NIC "
+    hdr = (f"| window | step (ms) | IO off around it (ms) | change | EP TX / NIC mean (Gb/s) | EP {a.bin_ms:g} ms p50 / p99 "
+           f"| decode RX {a.bin_ms:g} ms p99 / max | KV transfers | KV ms p50 / p99 | KV latency ms p50 / p99 | KV GB/s / NIC "
            "| retx pkts/s (source) | seq err/s (decode) | CNP/s (decode) |")
     print(hdr)
     print("|" + "|".join(["---"] * (hdr.count("|") - 1)) + "|")
@@ -163,13 +169,13 @@ def main():
         for n in dec:
             if n not in nm:
                 continue
-            ft, fv, st, sv = nm[n]
-            tx, rx, _ = bins(ft, fv, t0, t1)
+            S, st, sv = nm[n]
+            tx, rx, _ = bins(S, t0, t1)
             if tx is not None:
                 txs.append(tx); rxs.append(rx)
             cnp += slow_rate(st, sv, t0, t1, 3)
             seq += slow_rate(st, sv, t0, t1, 5) + slow_rate(st, sv, t0, t1, 6)
-        retx = sum(slow_rate(nm[n][2], nm[n][3], t0, t1, 0) for n in nm)
+        retx = sum(slow_rate(nm[n][1], nm[n][2], t0, t1, 0) for n in nm)
         tx = np.concatenate(txs) if txs else np.zeros((1, 8))
         rx = np.concatenate(rxs) if rxs else np.zeros((1, 8))
         io = io_records(rd, w) if not w.startswith("base") else dict(n=0, dur50=np.nan, dur99=np.nan, lat50=np.nan,
@@ -180,12 +186,12 @@ def main():
               f"{retx:.0f} | {seq:.0f} | {cnp:.0f} |")
         if a.plots and dec and dec[0] in nm:
             os.makedirs(a.plots, exist_ok=True)
-            ft, fv, _, _ = nm[dec[0]]
-            tx, rx, t = bins(ft, fv, t0, t1)
+            S = nm[dec[0]][0]
+            tx, rx, t = bins(S, t0, t1)
             if tx is not None:
                 plot(os.path.join(a.plots, f"{w}_{dec[0]}_overview.png"), f"{w} {dec[0]}", t, tx, rx)
                 z0 = t0 + 30
-                tx, rx, t = bins(ft, fv, z0, z0 + a.zoom_s)
+                tx, rx, t = bins(S, z0, z0 + a.zoom_s)
                 plot(os.path.join(a.plots, f"{w}_{dec[0]}_zoom.png"), f"{w} {dec[0]} ({a.zoom_s:g} s)", t, tx, rx)
 
 

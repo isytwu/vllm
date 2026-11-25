@@ -55,7 +55,7 @@ datasources:
     url: http://127.0.0.1:$VP
     isDefault: true
     jsonData:
-      timeInterval: 10ms
+      timeInterval: 5ms
 EOF
 cat > grafana-conf/provisioning/dashboards/files.yaml << EOF
 apiVersion: 1

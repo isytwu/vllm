@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """nicmon_to_vm.py: load a run's nicmon traces (and its windows and step times) into VictoriaMetrics for Grafana.
 
-  python3 tools/nicmon_to_vm.py results/e2e/<run> [--vm http://127.0.0.1:18428] [--bin-ms 10]
+  python3 tools/nicmon_to_vm.py results/e2e/<run> [--vm http://127.0.0.1:18428] [--bin-ms 5]
 
 Series (labels run, node, nic):
-  nic_rx_gbps / nic_tx_gbps      each NIC's RDMA bytes, Gb/s, on a --bin-ms grid (the counters move every ~10.7 ms)
+  nic_rx_gbps / nic_tx_gbps      each NIC's RDMA bytes, Gb/s, on a --bin-ms grid (default 5 ms)
   nic_retx_pps, nic_cnp_pps, nic_ecn_pps, nic_seqerr_pps   per second, from nicmon's slower rows (~100 ms)
   window_on{window}              1 while an IO window's IO runs (events.tsv <name>_io_on .. <name>_io_end), else 0
   step_ms                        the loadgen's median gap between streamed chunks per 10 s record (one decode step)
@@ -20,7 +20,7 @@ import urllib.request
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from nicmon_load import SLOW, load, rates  # noqa: E402
+from nicmon_load import SLOW, NDEV, load, rates, span  # noqa: E402
 
 
 def push(vm, lines):
@@ -46,19 +46,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("run_dir")
     ap.add_argument("--vm", default="http://127.0.0.1:18428")
-    ap.add_argument("--bin-ms", type=float, default=10.0)
+    ap.add_argument("--bin-ms", type=float, default=5.0)
     a = ap.parse_args()
     run = os.path.basename(os.path.normpath(a.run_dir))
     b = a.bin_ms / 1e3
     for path in sorted(glob.glob(os.path.join(a.run_dir, "nicmon_*.csv.gz"))):
         node = re.sub(r"^nicmon_|\.csv\.gz$", "", os.path.basename(path))
-        tn, fv, st, sv = load(path)
-        if len(tn) < 2:
+        S, st, sv = load(path)
+        t0, t1 = span(S)
+        if not t1 > t0:
             continue
-        grid = np.arange(np.ceil(tn[0, 0] / b) * b, tn[-1, 0], b)
+        grid = np.arange(np.ceil(t0 / b) * b, t1, b)
         mid = grid[1:]
-        tx, rx = rates(tn, fv, grid)
-        for i in range(fv.shape[1] // 2):
+        tx, rx = rates(S, grid)
+        for i in range(NDEV):
             lab = {"run": run, "node": node, "nic": f"ionic_{i}"}
             series("nic_tx_gbps", lab, mid, tx[:, i], a.vm)
             series("nic_rx_gbps", lab, mid, rx[:, i], a.vm)
@@ -67,7 +68,7 @@ def main():
                 d = np.diff(sv[:, i * k:(i + 1) * k], axis=0) / np.diff(st)[:, None]
                 for name, col in (("nic_retx_pps", 0), ("nic_cnp_pps", 3), ("nic_ecn_pps", 4), ("nic_seqerr_pps", 5)):
                     series(name, lab, st[1:], d[:, col], a.vm)
-        print(f"{node}: {len(tn)} counter rows, {len(grid) - 1} bins of {a.bin_ms:g} ms", flush=True)
+        print(f"{node}: {sum(len(s[0]) for s in S)} NIC samples, {len(grid) - 1} bins of {a.bin_ms:g} ms", flush=True)
     ev = os.path.join(a.run_dir, "events.tsv")
     if os.path.exists(ev):
         on = {}
