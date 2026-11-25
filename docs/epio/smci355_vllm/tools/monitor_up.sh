@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Runs on the LOGIN node:  bash tools/monitor_up.sh [results/e2e/<run> ...]
-# VictoriaMetrics (127.0.0.1:$VM_PORT, 18428) and Grafana (127.0.0.1:$GRAFANA_PORT, 23300; anonymous viewers) under
-# monitor/, downloaded on first use; then each run's nicmon traces go into VictoriaMetrics (tools/nicmon_to_vm.py)
-# and the nicmon dashboard is provisioned (tools/grafana_dash.py, its default time range on the first run's first MK
-# window). Both listen on localhost only: forward the Grafana port (Cursor / VS Code: Ports) and open
-# http://localhost:23300/d/nicmon. The admin password is generated into monitor/grafana-conf/admin_password.
+# VictoriaMetrics (127.0.0.1:$VM_PORT, 18428) and Grafana ($GRAFANA_ADDR:$GRAFANA_PORT, 0.0.0.0:23300; anonymous
+# viewers) under monitor/, downloaded on first use; then each run's nicmon traces go into VictoriaMetrics
+# (tools/nicmon_to_vm.py) and the nicmon dashboard is provisioned (tools/grafana_dash.py, its default time range on the
+# first run's first MK window). Open http://<this node's IP>:23300/d/nicmon (the script prints it); with
+# GRAFANA_ADDR=127.0.0.1, forward the port instead (Cursor / VS Code: Ports) and open http://localhost:23300/d/nicmon.
+# VictoriaMetrics stays on localhost (Grafana queries it). The admin password goes into monitor/grafana-conf/admin_password.
 set -euo pipefail
 W=$(cd "$(dirname "$0")/.." && pwd)
 M=$W/monitor
-VP=${VM_PORT:-18428} GP=${GRAFANA_PORT:-23300}
+VP=${VM_PORT:-18428} GP=${GRAFANA_PORT:-23300} GA=${GRAFANA_ADDR:-0.0.0.0}
 mkdir -p "$M/grafana-conf/provisioning/datasources" "$M/grafana-conf/provisioning/dashboards" \
     "$M/grafana-conf/dashboards" "$M/grafana-data"
 cd "$M"
@@ -25,7 +26,7 @@ G=$(ls -d "$M"/grafana-*/ | head -1)
 [ -s grafana-conf/admin_password ] || { python3 -c "import secrets; print(secrets.token_urlsafe(12))" > grafana-conf/admin_password; chmod 600 grafana-conf/admin_password; }
 cat > grafana-conf/custom.ini << EOF
 [server]
-http_addr = 127.0.0.1
+http_addr = $GA
 http_port = $GP
 [paths]
 data = $M/grafana-data
@@ -79,4 +80,5 @@ fi
 for r in "$@"; do python3 "$W/tools/nicmon_to_vm.py" "$r" --vm "http://127.0.0.1:$VP"; done
 python3 "$W/tools/grafana_dash.py" ${1:+"$1"}
 curl -s -X POST -u "admin:$(cat grafana-conf/admin_password)" "http://127.0.0.1:$GP/api/admin/provisioning/dashboards/reload" > /dev/null
-echo "Grafana: http://localhost:$GP/d/nicmon (forward port $GP)"
+ip=$(ip -4 -o addr show 2>/dev/null | awk '$2 !~ /^(lo|docker|br-|tunl|benic)/ {sub("/.*", "", $4); print $4; exit}')
+[ "$GA" = 127.0.0.1 ] && echo "Grafana: http://localhost:$GP/d/nicmon (forward port $GP)" || echo "Grafana: http://$ip:$GP/d/nicmon"

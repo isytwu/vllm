@@ -83,9 +83,9 @@ vLLM 的 K3.1 没有做 sequence-parallel MoE，同样的 batch，EP 的量比 M
 
 ### 2.5 Grafana
 
-登录节点上跑 VictoriaMetrics 和 Grafana（都只监听 127.0.0.1）：`bash tools/monitor_up.sh results/e2e/<run> ...` 会下载、启动、把 nicmon 的数据导进去（`tools/nicmon_to_vm.py`），并加载仿照 Moonshot 截图的面板（`tools/grafana_dash.py`）。
+登录节点上跑 VictoriaMetrics（只监听本机）和 Grafana（监听 23300 端口）：`bash tools/monitor_up.sh results/e2e/<run> ...` 会下载、启动、把 nicmon 的数据导进去（`tools/nicmon_to_vm.py`），并加载仿照 Moonshot 截图的面板（`tools/grafana_dash.py`）。
 
-- 打开方式：在 Cursor / VS Code 的 Ports 里转发 23300，浏览器打开 `http://localhost:23300/d/nicmon`（匿名只读）。
+- 打开方式：浏览器直接打开 **http://10.235.192.132:23300/d/nicmon**（登录节点 n06-21 的内网 IP，匿名只读）。如果 Grafana 只监听本机（`GRAFANA_ADDR=127.0.0.1`），就在 Cursor / VS Code 的 Ports 里转发 23300，再打开 `http://localhost:23300/d/nicmon`。
 - 面板：选定节点每张卡的接收 / 发送（Gb/s，每个点是相邻两次读数之间的平均速率）、每台机器的合计、CNP、重传、序号错、注入窗口的时间线、decode 每步。
 - 运行名：`e1t1_7112` 是每个 rank 32 条，`e1x_7112` 是 64 条，`e1ra_7112` 是 incast。拉到 10–20 秒的范围就能看到每个读数（每张卡约 12 ms 一个）。
 
