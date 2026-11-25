@@ -1,6 +1,8 @@
 # smci355 上按 Moonshot 的流量复现 KV 对 EP 的影响（vLLM K3.1，EP16）
 
 2026-11-25 夜里，作业 7112（3 台：n08-21、n08-25 做 decode，n09-29 做负载和 IO 来源）。
+
+续篇：[真实 PD 和软件层面缓解](k31_smci355_pd_mitigation_zh.md)（真实 prefill 的 KV、KV 和 EP 错开、配置建议）；这些实验的数据都在 [Grafana 面板](k31_smci355_grafana_zh.md) 里。
 这份文档只写这次用到的测试方法和结论。之前更多的测试方法见 [复现指南](k31_smci355_vllm_ep_io_repro_zh.md)，之前的结论见 [结论文档](k31_smci355_vllm_ep_io_zh.md)。
 
 ## 先说结论
