@@ -5,7 +5,7 @@
 
 ## 先说结论
 
-1. **流量对上了。** 每个 rank 64 条时，EP 每张卡 10 ms 精度的平台是 31–33 Gb/s（Moonshot 30–37 Gb/s）。KV 按截图塑形：每张卡每秒约 2.5 次、每次 1 GiB 的线速突发，10 ms 尖峰 220–420 Gb/s、每次 20–45 ms（Moonshot 250–400 Gb/s、20–40 ms）。曲线的样子和截图一样，原始的 10 ms 数据在 Grafana 里能看（2.5 节）。
+1. **流量对上了。** 每个 rank 64 条时，按每张卡相邻两次读数（约 12 ms）算，EP 的平台是 31–34 Gb/s（Moonshot 30–37 Gb/s）。KV 按截图塑形：每张卡每秒约 2.5 次、每次 1 GiB 的线速突发，尖峰 230–390 Gb/s、每次 20–45 ms（Moonshot 250–400 Gb/s、20–40 ms）。曲线的样子和截图一样，每个读数在 Grafana 里都能看（2.5 节）。
 2. **同样的流量，KV 和 EP 同在 TC 104 时，decode 每步慢 10.7%–11.5%**，EP dispatch 慢 30%–46%。KV 多一倍时慢 29%，写进跨 NUMA 的主机内存慢 23%，2:1 incast 慢 9%，decode 主动读慢 8%–10%。多出来的时间几乎都在 EP 上：EP 的包在交换机里排在 KV 后面，decode 每秒收到几千到上万个 CNP。
 3. **KV 换到 TC 0 后，所有测过的场景里 EP 都回到 0.1%–0.5%。** 测过的场景包括：一个来源、频率加倍、写主机内存、decode 主动读、2:1 incast、decode 节点自己也在发 KV。**Moonshot 说的“走 TC 0 还慢 5%”，在 smci355 的 EP16 上没有复现。**
 4. **TC 0 的代价在 KV 自己，而且只在拥塞时出现。** 一个来源时 KV 反而更快（每次 24 ms，TC 104 是 34 ms），也不丢包。2:1 incast 时，发送端每秒重传约 9.4 万个包，KV 每次的 p99 从 50 ms 变成 65 ms；decode 主动读再加 incast 时，p99 到 118 ms。
@@ -42,11 +42,11 @@ Moonshot 给了 decode 节点每张网卡 10 ms 精度的收发曲线（面板�
 
 vLLM 的 K3.1 没有做 sequence-parallel MoE，同样的 batch，EP 的量比 Moonshot 大；所以用每个 rank 的条数来对 EP 的流量：
 
-| 每个 DP rank 的条数 | 每步 | EP：每张卡发送，平均 | 10 ms 精度下的平台 |
+| 每个 DP rank 的条数 | 每步 | EP：每张卡发送，平均 | 按读数间隔（约 12 ms）的平台 |
 |---|---|---|---|
 | 16 | 94.5 ms | 14.4 Gb/s | — |
 | 32 | 122 ms | 21 Gb/s | 约 23–25 Gb/s |
-| **64** | **184 ms** | **28 Gb/s** | **31–33 Gb/s（p50 31、p99 33）** |
+| **64** | **184 ms** | **28 Gb/s** | **31–34 Gb/s（p50 31、p99 34）** |
 | Moonshot（EP32，全局 512） | 约 80 ms | 约 25 Gb/s | 30–37 Gb/s |
 
 64 条时每张卡的 EP 流量和 Moonshot 的平台对上了，只是我们的一步更长。结论以 64 条为主，32 条作对照。
@@ -57,7 +57,7 @@ vLLM 的 K3.1 没有做 sequence-parallel MoE，同样的 batch，EP 的量比 M
 
 - 每台 decode 的 KV 按泊松过程到达，平均每秒 6.7 次；每次随机落在 8 张卡里的 3 张上，所以每张卡平均每秒约 2.5 次。
 - 每次每张卡 1 GiB，拆成 16 MB 一批，同时 2 批在途，线速连续发；GPU i → GPU i（同一条 rail），用 MoRI IO 的 RDMA WRITE 写进 decode 的 GPU 显存（`R` 是 decode 主动读，MoRIIO 的方向）。
-- 空闲时一次 22.7 ms 传完（47 GB/s，376 Gb/s）。和 EP 一起、C 的网卡同时给两台 decode 发时，一次 33 ms 左右，10 ms 精度下的尖峰是 220–420 Gb/s。每张卡平均 2.5–3 GB/s，和截图里的繁忙时段相当。
+- 空闲时一次 22.7 ms 传完（47 GB/s，376 Gb/s）。和 EP 一起、C 的网卡同时给两台 decode 发时，一次 33 ms 左右，按读数间隔算的尖峰是 230–390 Gb/s。每张卡平均 2.5–3 GB/s，和截图里的繁忙时段相当。
 - 变体：
 
 | 后缀 | 含义 |
@@ -69,24 +69,25 @@ vLLM 的 K3.1 没有做 sequence-parallel MoE，同样的 batch，EP 的量比 M
 | `Hn` / `Hf` | 写进 decode 的主机内存（锁页），和网卡同一个 NUMA / 另一个 NUMA（模拟 Mooncake Store 那样的 DRAM 池） |
 | `x2i` / `B` | incast：第二个来源 n08-25 和 C 同时写 n08-21（同一份时间表，每次都 2:1）/ 只有 n08-25 写 |
 
-### 2.4 监控：nicmon，每张网卡 10 ms
+### 2.4 监控：nicmon，每张网卡的收发字节
 
 `tools/nicmon.py` 在每台机器上读每张 ionic 网卡的 RDMA 收发字节（`hw_counters/tx_rdma_ucast_bytes`、`rx_rdma_ucast_bytes`），另外每 100 ms 读重传、CNP、ECN 和序号错。e2e/e1.sh 设 `NICMON=1` 时整轮都开着。两个坑：
 
-- **内核缓存。** 内核的 RDMA 统计会把这些计数缓存 10 ms（`hw_counters/lifespan`），读到的值最多旧 10 ms，换算成 10 ms 的速率会出现 1000 Gb/s 以上的假尖峰。所以运行期间把 `lifespan` 调成 1 ms（要 sudo，结束时恢复 10）。
-- **读一次要从网卡取。** 调成 1 ms 后每次读都走到网卡，负载下约 1.3 ms，偶尔约 95 ms。这次跑的 nicmon 是 8 张卡依次读，一轮约 13 ms，所以每张卡约每 13 ms 一个点；每张卡记自己的读取时间，速率按它算。（一开始以为固件每 10.7 ms 才刷新一次，那其实就是一轮依次读的耗时，不是网卡的限制。）
+- **原始数据就是计数器。** ionic 只提供累计计数，没有现成的速率。nicmon 的原始文件是每次读取的“读取时间 + 计数值”，值变了才记一行；速率是相邻两次读数相减、再除以时间差。Moonshot 面板上的 `port_rcv_data` / `port_xmit_data` 也是计数器，曲线同样是算出来的速率。
+- **内核缓存。** 内核的 RDMA 统计会把这些计数缓存 10 ms（`hw_counters/lifespan`），读到的值最多旧 10 ms，算出来会有 1000 Gb/s 以上的假尖峰。所以运行期间把 `lifespan` 调成 1 ms（要 sudo，结束时恢复 10）。
+- **读一次要从网卡取。** 调成 1 ms 后，每次读都走到网卡，负载下约 1.3 ms，偶尔约 95 ms。这次的 nicmon 是 8 张卡依次读，每张卡相邻两次读数的间隔：中位 11.8 ms，大部分在 10–22 ms，约 2% 超过 50 ms（读一次卡住，最长约 100 ms）。（一开始以为固件每 10.7 ms 才刷新一次，其实那是依次读的耗时。）
 
-这次的数据实际精度是每张卡约每 13 ms 一个点，图里按 10 ms 一格画，是为了和 Moonshot 的截图对照。偶尔读一次卡住约 100 ms，那一段只能按平均值画（图上的平线）。
+**这次数据的精度就是每张卡约 12 ms 一个点。** 图和 Grafana 里每个点都是相邻两次读数之间的平均速率，不插值、不对齐到固定格子。一次读本身要约 1.3 ms，读数对应的时刻有这么大的不确定，所以偶尔会有一个点略超线速。
 
-`tools/nicmon.py` 已经改成每张卡一个线程并行读，预计每张卡约 1.5–2.5 ms 一个点，可以按 5 ms 甚至更细出图；分析、Grafana 和画图默认改成 5 ms 一格（`--bin-ms` 可调）。新版本还没在机器上跑过，下次有机器时先验证。
+`tools/nicmon.py` 已经改成每张卡一个线程并行读，预计每张卡约 1.5–2.5 ms 一个点。新版本还没在机器上跑过，下次有机器时先验证。
 
 ### 2.5 Grafana
 
 登录节点上跑 VictoriaMetrics 和 Grafana（都只监听 127.0.0.1）：`bash tools/monitor_up.sh results/e2e/<run> ...` 会下载、启动、把 nicmon 的数据导进去（`tools/nicmon_to_vm.py`），并加载仿照 Moonshot 截图的面板（`tools/grafana_dash.py`）。
 
 - 打开方式：在 Cursor / VS Code 的 Ports 里转发 23300，浏览器打开 `http://localhost:23300/d/nicmon`（匿名只读）。
-- 面板：选定节点每张卡的接收 / 发送（Gb/s，10 ms）、每台机器的合计、CNP、重传、序号错、注入窗口的时间线、decode 每步。
-- 运行名：`e1t1_7112` 是每个 rank 32 条，`e1x_7112` 是 64 条，`e1ra_7112` 是 incast。拉到 10–20 秒的范围就能看到 10 ms 的原始数据。
+- 面板：选定节点每张卡的接收 / 发送（Gb/s，每个点是相邻两次读数之间的平均速率）、每台机器的合计、CNP、重传、序号错、注入窗口的时间线、decode 每步。
+- 运行名：`e1t1_7112` 是每个 rank 32 条，`e1x_7112` 是 64 条，`e1ra_7112` 是 incast。拉到 10–20 秒的范围就能看到每个读数（每张卡约 12 ms 一个）。
 
 ### 2.6 每个窗口怎么比
 
@@ -97,9 +98,9 @@ vLLM 的 K3.1 没有做 sequence-parallel MoE，同样的 batch，EP 的量比 M
 
 ## 3. 任务一：同样的流量下，KV 对 EP 的影响
 
-![每个 rank 64 条，Moonshot 形状的 KV（TC 104）：n08-21 每张卡的接收和发送，10 ms](img/mk64_MK_traffic.png)
+![每个 rank 64 条，Moonshot 形状的 KV（TC 104）：n08-21 每张卡的接收和发送，每一段是相邻两次读数之间的平均速率](img/mk64_MK_traffic.png)
 
-上面两张是 60 秒，下面两张是其中 0.8 秒。接收那一侧，约 30 Gb/s 的 EP 底上叠着 220–300 Gb/s、20–40 ms 的 KV 尖峰，一次落在几张卡上；发送那一侧是 EP，20–33 Gb/s。和 Moonshot 的截图是一个样子。不注入时的同一张图见 `img/mk64_base1_traffic.png`。
+上面两张是 60 秒，下面两张是其中 0.8 秒，每一段阶梯是一个读数间隔（约 12 ms）。接收那一侧，约 30 Gb/s 的 EP 底上叠着 220–300 Gb/s、20–40 ms 的 KV 尖峰，一次落在几张卡上；发送那一侧是 EP，20–33 Gb/s。和 Moonshot 的截图是一个样子。不注入时的同一张图见 `img/mk64_base1_traffic.png`。
 
 **KV 和 EP 同在 TC 104：**
 
@@ -184,7 +185,7 @@ vLLM 的 K3.1 没有做 sequence-parallel MoE，同样的 batch，EP 的量比 M
 
 ![incast 这一轮：每个窗口的每步变化和 EP dispatch 变化](img/mk_impact_incast.png)
 
-- **2:1 incast 时 KV 走 TC 0，EP 也只慢 0.3%，还是没有复现 5%。** 这时 n08-21 的网卡已经被打满，10 ms 尖峰到约 390 Gb/s（`img/mk64_MKx2i_traffic.png`）。
+- **2:1 incast 时 KV 走 TC 0，EP 也只慢 0.3%，还是没有复现 5%。** 这时 n08-21 的网卡已经被打满，尖峰到约 390 Gb/s（`img/mk64_MKx2i_traffic.png`）。
 - **TC 0 在 incast 时开始丢包。**
   - 写入时，两个来源每秒共重传约 9.4 万个包，KV 每次的 p99 从 49.7 ms 涨到 64.6 ms。
   - 再加限速，丢包反而更多，因为限速之后仍是 16 MB 一批。

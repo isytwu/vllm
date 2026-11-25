@@ -10,7 +10,7 @@ Per window (IO on = events <w>_io_on - 20 s .. <w>_io_end; base = the base windo
            for the previous transfer), rate per NIC while transferring; decode RX bins p99 / max
   loss     retransmitted packets / s at the senders, sequence errors / s at the receivers (TC 0 drops)
   CNP      CNPs / s at the decode nodes (EP packets marked in a switch queue)
-Plots: Moonshot-style per-NIC RX / TX (--bin-ms bins, default 5) of the first decode node, an overview of the window and a zoom.
+Plots: Moonshot-style per-NIC RX / TX (each point the average between two consecutive reads; --bin-ms to resample) of the first decode node, an overview of the window and a zoom.
 """
 import argparse
 import glob
@@ -22,10 +22,28 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from nicmon_load import SLOW, load as load_nicmon, rates  # noqa: E402
+from nicmon_load import SLOW, load as load_nicmon, native, rates  # noqa: E402
 
 
-BIN = 0.005
+BIN = 0.0
+
+
+def window_rates(series, t0, t1):
+    """rates of every NIC in [t0, t1): (TX samples, RX samples, mean TX per NIC). The samples are the averages between
+    consecutive reads (BIN = 0) or the bins of BIN s; the mean comes straight from the counters at t0 and t1"""
+    good = [s for s in series if len(s[0]) > 1]
+    if not good:
+        return np.zeros(1), np.zeros(1), float("nan")
+    mean = float(np.mean([(np.interp(t1, s[0], s[1]) - np.interp(t0, s[0], s[1])) / (t1 - t0) * 8 / 1e9 for s in good]))
+    if BIN > 0:
+        tx, rx, _ = bins(series, t0, t1)
+        return tx.ravel(), rx.ravel(), mean
+    txs, rxs = [], []
+    for t, a, b in native(series):
+        m = (t >= t0) & (t < t1)
+        txs.append(a[m]); rxs.append(b[m])
+    tx, rx = np.concatenate(txs), np.concatenate(rxs)
+    return (tx if tx.size else np.zeros(1)), (rx if rx.size else np.zeros(1)), mean
 
 
 def bins(series, t0, t1, b=None):
@@ -113,19 +131,24 @@ def io_records(run_dir, w):
                 rate50=pct(rate, 50))
 
 
-def plot(path, title, t, tx, rx, nic_line=400):
+def plot(path, title, series, t0, t1, nic_line=400):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     plt.style.use("dark_background")
     fig, ax = plt.subplots(1, 2, figsize=(16, 4.2))
-    x = t - t[0]
-    for i in range(rx.shape[1]):
-        ax[0].plot(x, rx[:, i], lw=0.8, label=f"ionic_{i}")
-        ax[1].plot(x, tx[:, i], lw=0.8, label=f"ionic_{i}")
-    ax[0].set_title(f"{title}: port_rcv_data (Gb/s, {BIN * 1e3:g} ms)")
-    ax[1].set_title(f"{title}: port_xmit_data (Gb/s, {BIN * 1e3:g} ms)")
+    if BIN > 0:
+        tx, rx, t = bins(series, t0, t1)
+        per = [(t, tx[:, i], rx[:, i]) for i in range(tx.shape[1])]
+    else:
+        per = [(t[(t >= t0) & (t < t1)], a[(t >= t0) & (t < t1)], b[(t >= t0) & (t < t1)]) for t, a, b in native(series)]
+    for i, (t, a, b) in enumerate(per):
+        ax[0].plot(t - t0, b, lw=0.8, drawstyle="steps-pre", label=f"ionic_{i}")
+        ax[1].plot(t - t0, a, lw=0.8, drawstyle="steps-pre", label=f"ionic_{i}")
+    how = f"{BIN * 1e3:g} ms bins" if BIN > 0 else "between consecutive reads"
+    ax[0].set_title(f"{title}: port_rcv_data (Gb/s, {how})")
+    ax[1].set_title(f"{title}: port_xmit_data (Gb/s, {how})")
     for a in ax:
         a.set_xlabel("s"); a.grid(alpha=0.2); a.set_ylim(bottom=0)
     ax[0].axhline(nic_line, color="w", lw=0.5, ls=":")
@@ -140,7 +163,7 @@ def main():
     ap.add_argument("run_dir")
     ap.add_argument("--plots")
     ap.add_argument("--zoom-s", type=float, default=0.8)
-    ap.add_argument("--bin-ms", type=float, default=5.0)
+    ap.add_argument("--bin-ms", type=float, default=0.0, help="resample onto this grid (0 = each read interval)")
     ap.add_argument("--decode", default=None, help="decode nodes (default: the serve_<node>.log ones)")
     a = ap.parse_args()
     global BIN
@@ -155,44 +178,42 @@ def main():
     lv = live(rd)
     base = [steps(lv, w[1], w[2]) for w in ws if w[0].startswith("base")]
     b0 = float(np.nanmean(base)) if base else float("nan")
+    per = f"{a.bin_ms:g} ms bins" if a.bin_ms > 0 else "per read"
     print(f"run {os.path.basename(os.path.normpath(rd))}: decode {dec}, IO source {src}, base windows' step "
           f"{' / '.join(f'{x:.1f}' for x in base)} ms")
-    hdr = (f"| window | step (ms) | IO off around it (ms) | change | EP TX / NIC mean (Gb/s) | EP {a.bin_ms:g} ms p50 / p99 "
-           f"| decode RX {a.bin_ms:g} ms p99 / max | KV transfers | KV ms p50 / p99 | KV latency ms p50 / p99 | KV GB/s / NIC "
+    hdr = (f"| window | step (ms) | IO off around it (ms) | change | EP TX / NIC mean (Gb/s) | EP {per} p50 / p99 "
+           f"| decode RX {per} p99 / max | KV transfers | KV ms p50 / p99 | KV latency ms p50 / p99 | KV GB/s / NIC "
            "| retx pkts/s (source) | seq err/s (decode) | CNP/s (decode) |")
     print(hdr)
     print("|" + "|".join(["---"] * (hdr.count("|") - 1)) + "|")
     for wi, (w, t0, t1, _, _) in enumerate(ws):
         s = steps(lv, t0, t1)
         lb = local_base(lv, ws, wi)
-        txs, rxs, cnp, seq = [], [], 0.0, 0.0
+        txs, rxs, means, cnp, seq = [], [], [], 0.0, 0.0
         for n in dec:
             if n not in nm:
                 continue
             S, st, sv = nm[n]
-            tx, rx, _ = bins(S, t0, t1)
-            if tx is not None:
-                txs.append(tx); rxs.append(rx)
+            tx, rx, mean = window_rates(S, t0, t1)
+            txs.append(tx); rxs.append(rx); means.append(mean)
             cnp += slow_rate(st, sv, t0, t1, 3)
             seq += slow_rate(st, sv, t0, t1, 5) + slow_rate(st, sv, t0, t1, 6)
         retx = sum(slow_rate(nm[n][1], nm[n][2], t0, t1, 0) for n in nm)
-        tx = np.concatenate(txs) if txs else np.zeros((1, 8))
-        rx = np.concatenate(rxs) if rxs else np.zeros((1, 8))
+        tx = np.concatenate(txs) if txs else np.zeros(1)
+        rx = np.concatenate(rxs) if rxs else np.zeros(1)
+        ep_mean = float(np.nanmean(means)) if means else float("nan")
         io = io_records(rd, w) if not w.startswith("base") else dict(n=0, dur50=np.nan, dur99=np.nan, lat50=np.nan,
                                                                        lat99=np.nan, rate50=np.nan)
-        print(f"| {w} | {s:.1f} | {lb:.1f} | {(s / lb - 1) * 100:+.1f}% | {tx.mean():.1f} | {np.percentile(tx, 50):.0f} / "
+        print(f"| {w} | {s:.1f} | {lb:.1f} | {(s / lb - 1) * 100:+.1f}% | {ep_mean:.1f} | {np.percentile(tx, 50):.0f} / "
               f"{np.percentile(tx, 99):.0f} | {np.percentile(rx, 99):.0f} / {rx.max():.0f} | {io['n']} | "
               f"{io['dur50']:.1f} / {io['dur99']:.1f} | {io['lat50']:.1f} / {io['lat99']:.1f} | {io['rate50']:.1f} | "
               f"{retx:.0f} | {seq:.0f} | {cnp:.0f} |")
         if a.plots and dec and dec[0] in nm:
             os.makedirs(a.plots, exist_ok=True)
             S = nm[dec[0]][0]
-            tx, rx, t = bins(S, t0, t1)
-            if tx is not None:
-                plot(os.path.join(a.plots, f"{w}_{dec[0]}_overview.png"), f"{w} {dec[0]}", t, tx, rx)
-                z0 = t0 + 30
-                tx, rx, t = bins(S, z0, z0 + a.zoom_s)
-                plot(os.path.join(a.plots, f"{w}_{dec[0]}_zoom.png"), f"{w} {dec[0]} ({a.zoom_s:g} s)", t, tx, rx)
+            plot(os.path.join(a.plots, f"{w}_{dec[0]}_overview.png"), f"{w} {dec[0]}", S, t0, t1)
+            z0 = t0 + 30
+            plot(os.path.join(a.plots, f"{w}_{dec[0]}_zoom.png"), f"{w} {dec[0]} ({a.zoom_s:g} s)", S, z0, z0 + a.zoom_s)
 
 
 if __name__ == "__main__":

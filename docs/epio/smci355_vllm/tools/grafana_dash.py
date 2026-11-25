@@ -3,7 +3,8 @@
 
   python3 tools/grafana_dash.py [results/e2e/<run> [<window>]]
 
-The panels mirror Moonshot's decode-node screenshots ("IB std port_rcv_data / port_xmit_data", per NIC; 5 ms here):
+The panels mirror Moonshot's decode-node screenshots ("IB std port_rcv_data / port_xmit_data", per NIC; here each point
+is the average between two consecutive reads of that NIC):
 RX and TX of every NIC of the chosen node, every node's totals, CNP / ECN / retransmissions / sequence errors, the IO
 windows and the decode step. With a run (and a window, default the first MK window) the default time range is the
 first 20 s of that window's IO.
@@ -18,11 +19,11 @@ DS = {"type": "prometheus", "uid": "vm"}
 
 def ts_panel(title, expr, legend, x, y, w, h, unit="suffix: Gb/s", desc=""):
     return {"type": "timeseries", "title": title, "description": desc, "datasource": DS,
-            "gridPos": {"x": x, "y": y, "w": w, "h": h}, "interval": "5ms", "maxDataPoints": 4000,
+            "gridPos": {"x": x, "y": y, "w": w, "h": h}, "interval": "1ms", "maxDataPoints": 4000,
             "targets": [{"refId": "A", "datasource": DS, "expr": expr, "legendFormat": legend, "range": True}],
             "fieldConfig": {"defaults": {"unit": unit, "decimals": 0, "min": 0,
                                          "custom": {"lineWidth": 1, "fillOpacity": 0, "showPoints": "never",
-                                                    "spanNulls": False}}, "overrides": []},
+                                                    "spanNulls": True}}, "overrides": []},
             "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["mean", "max"]},
                         "tooltip": {"mode": "multi", "sort": "desc"}}}
 
@@ -48,9 +49,9 @@ def main():
     window = sys.argv[2] if len(sys.argv) > 2 else None
     sel = 'run="$run",node="$node",nic=~"$nic"'
     panels = [
-        ts_panel("$node port_rcv_data（每张网卡接收，5 ms）", f"max_over_time(nic_rx_gbps{{{sel}}}[$__interval])",
+        ts_panel("$node port_rcv_data（每张网卡接收；每个点 = 相邻两次读数之间的平均速率）", f"max_over_time(nic_rx_gbps{{{sel}}}[$__interval])",
                  "{{nic}}", 0, 0, 12, 10, desc="decode 节点：EP（另一台 decode 发来）+ KV / 注入的 IO"),
-        ts_panel("$node port_xmit_data（每张网卡发送，5 ms）", f"max_over_time(nic_tx_gbps{{{sel}}}[$__interval])",
+        ts_panel("$node port_xmit_data（每张网卡发送；每个点 = 相邻两次读数之间的平均速率）", f"max_over_time(nic_tx_gbps{{{sel}}}[$__interval])",
                  "{{nic}}", 12, 0, 12, 10, desc="decode 节点只发 EP 和 READ 请求；C 节点发的是注入的 IO"),
         ts_panel("每台机器接收合计（8 张网卡）", 'sum by (node) (nic_rx_gbps{run="$run"})', "{{node}}", 0, 10, 12, 8),
         ts_panel("每台机器发送合计（8 张网卡）", 'sum by (node) (nic_tx_gbps{run="$run"})', "{{node}}", 12, 10, 12, 8),
@@ -68,7 +69,7 @@ def main():
          "options": {"showValue": "never", "mergeValues": True, "rowHeight": 0.8}},
         ts_panel("decode 每步（ms，客户端 10 秒中位数）", 'step_ms{run="$run"}', "step", 16, 26, 8, 7, unit="ms"),
     ]
-    dash = {"uid": "nicmon", "title": "nicmon：每张网卡 5 ms 流量（smci355）", "timezone": "browser", "schemaVersion": 39,
+    dash = {"uid": "nicmon", "title": "nicmon：每张网卡的收发速率（smci355）", "timezone": "browser", "schemaVersion": 39,
             "editable": True, "refresh": "", "panels": panels,
             "templating": {"list": [var("run", "label_values(nic_rx_gbps, run)"),
                                     var("node", 'label_values(nic_rx_gbps{run="$run"}, node)'),

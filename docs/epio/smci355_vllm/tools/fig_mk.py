@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """fig_mk.py: figures of the Moonshot-shaped KV runs (tools/mk_analyze.py's windows, e2e/e1_analyze.py's EP kernels).
 
-  python3 tools/fig_mk.py traffic <run_dir> <window> <out.png> [--node n08-21] [--zoom-at 30] [--zoom-s 0.8] [--bin-ms 5]
+  python3 tools/fig_mk.py traffic <run_dir> <window> <out.png> [--node n08-21] [--zoom-at 30] [--zoom-s 0.8] [--bin-ms <ms>]
   python3 tools/fig_mk.py impact <out.png> <label>=<run_dir>[:w1,w2,...] ...
 
-traffic: the node's per-NIC RX / TX like the decode-side screenshots (Gb/s, --bin-ms bins, default 5), 60 s of the
-         window's IO and a zoom.
+traffic: the node's per-NIC RX / TX like the decode-side screenshots (Gb/s; each point the average between two
+         consecutive reads, or --bin-ms bins), 60 s of the window's IO and a zoom.
 impact:  per window, the decode step's change against the IO-off stretches around it and the change of the MoRI EP
          dispatch kernel (mean of the ranks' means) against the run's base windows.
 """
@@ -18,7 +18,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mk_analyze as mk  # noqa: E402
-from nicmon_load import load, rates  # noqa: E402
+from nicmon_load import load, native, rates  # noqa: E402
 
 
 def dark():
@@ -36,16 +36,21 @@ def traffic(a):
     S, _, _ = load(os.path.join(a.run_dir, f"nicmon_{a.node}.csv.gz"))
     b = a.bin_ms / 1e3
     fig, ax = plt.subplots(2, 2, figsize=(16, 7.5))
+    nat = native(S)
+    how = f"{a.bin_ms:g} ms bins" if b > 0 else "between consecutive reads"
     for row, (s, e) in enumerate(((t0, min(t1, t0 + 60)), (t0 + a.zoom_at, t0 + a.zoom_at + a.zoom_s))):
-        g = np.arange(s, e, b)
-        tx, rx = rates(S, g)
-        x = g[:-1] - g[0]
-        for i in range(8):
-            ax[row][0].plot(x, rx[:, i], lw=0.7, label=f"ionic_{i}")
-            ax[row][1].plot(x, tx[:, i], lw=0.7, label=f"ionic_{i}")
+        if b > 0:
+            g = np.arange(s, e, b)
+            tx, rx = rates(S, g)
+            per = [(g[1:], tx[:, i], rx[:, i]) for i in range(8)]
+        else:
+            per = [(t[(t >= s) & (t < e)], x[(t >= s) & (t < e)], y[(t >= s) & (t < e)]) for t, x, y in nat]
+        for i, (t, x, y) in enumerate(per):
+            ax[row][0].plot(t - s, y, lw=0.7, drawstyle="steps-pre", label=f"ionic_{i}")
+            ax[row][1].plot(t - s, x, lw=0.7, drawstyle="steps-pre", label=f"ionic_{i}")
         span = f"{e - s:g} s" if row else "60 s"
-        ax[row][0].set_title(f"{a.node} port_rcv_data, Gb/s per NIC, {a.bin_ms:g} ms bins ({span})")
-        ax[row][1].set_title(f"{a.node} port_xmit_data, Gb/s per NIC, {a.bin_ms:g} ms bins ({span})")
+        ax[row][0].set_title(f"{a.node} port_rcv_data, Gb/s per NIC, {how} ({span})")
+        ax[row][1].set_title(f"{a.node} port_xmit_data, Gb/s per NIC, {how} ({span})")
         for c in ax[row]:
             c.set_ylim(bottom=0); c.grid(alpha=0.2); c.set_xlabel("s")
     ax[0][1].legend(fontsize=7, ncol=4, loc="upper right")
@@ -97,7 +102,7 @@ def main():
     t.add_argument("run_dir"); t.add_argument("window"); t.add_argument("out")
     t.add_argument("--node", default="n08-21"); t.add_argument("--zoom-at", type=float, default=30)
     t.add_argument("--zoom-s", type=float, default=0.8)
-    t.add_argument("--bin-ms", type=float, default=5.0)
+    t.add_argument("--bin-ms", type=float, default=0.0, help="resample onto this grid (0 = each read interval)")
     i = sub.add_parser("impact")
     i.add_argument("out"); i.add_argument("runs", nargs="+")
     a = ap.parse_args()

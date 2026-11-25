@@ -46,6 +46,20 @@ def load(path):
     return series, np.array(s_t), np.array(s_v, dtype=np.float64)
 
 
+def native(series):
+    """each NIC's average rate between two consecutive reads, stamped at the later read: [(times, tx Gb/s, rx Gb/s)].
+    No resampling: a point covers exactly the interval since the NIC's previous read."""
+    out = []
+    for t, txb, rxb in series:
+        if len(t) < 2:
+            out.append((np.array([]), np.array([]), np.array([])))
+            continue
+        dt = np.diff(t)
+        ok = dt > 0
+        out.append((t[1:][ok], (np.diff(txb) / dt * 8 / 1e9)[ok], (np.diff(rxb) / dt * 8 / 1e9)[ok]))
+    return out
+
+
 def span(series):
     """first and last sample time over the NICs"""
     ts = [s[0] for s in series if len(s[0])]
