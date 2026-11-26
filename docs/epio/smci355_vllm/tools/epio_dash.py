@@ -9,10 +9,12 @@ from epio_node. What each row shows and where it comes from:
   decode           epio_decode_* (e2e/loadgen.py --push): step time p50 / p99 per DP rank every second, sequence-steps
                    per second, open streams
   EP               epio_ep_us (tools/ep_push.py): MoRI dispatch / combine per profiler capture (one per window)
+  KV bursts x steps  inside a profiler capture: the decode's RX per NIC and the ECN marks it received (netmon), and
+                   every step's length and EP time (epio_ep_step_ms, tools/ep_push.py) on one time axis
   KV               epio_kv_ms / epio_kv_mb (mb/io_inject.py --push): every transfer's time and latency; p50 / p99 over a
                    sliding 30 s, transfers and GiB per second
   NICs             netmon_* (ainic-netmon, 2 ms): RX / TX per NIC (interval average; the highest 2 ms value), the KV
-                   source's TX, CNPs and ECN marks, retransmissions, ACK timeouts, PFC pauses
+                   source's TX, ECN marks received, CNPs received, retransmissions, ACK timeouts, PFC pauses
   summary          epio_summary (tools/epio_summary.py, after the run): one row per window
 """
 import argparse
@@ -31,10 +33,12 @@ def tgt(expr, legend="", ref="A", instant=False, fmt=None):
 
 
 def ts_panel(title, targets, x, y, w=12, h=8, unit="none", desc="", points=False, overrides=None, interval=None,
-             stack=False, min0=True):
+             stack=False, min0=True, step_after=False):
     custom = {"drawStyle": "points" if points else "line", "lineWidth": 1, "fillOpacity": 0, "spanNulls": False,
               "showPoints": "always" if points else "never", "pointSize": 9 if points else 3,
               "stacking": {"mode": "normal" if stack else "none"}}
+    if step_after:
+        custom.update(lineInterpolation="stepAfter", lineWidth=2, fillOpacity=15)
     p = {"type": "timeseries", "title": title, "description": desc, "datasource": DS,
          "gridPos": {"x": x, "y": y, "w": w, "h": h}, "targets": targets,
          "fieldConfig": {"defaults": {"unit": unit, "custom": custom, **({"min": 0} if min0 else {})},
@@ -79,8 +83,8 @@ def build():
     P.append({"type": "state-timeline", "title": "窗口：正在跑哪个窗口（上）/ 它的 IO 在跑（下）", "datasource": DS,
               "description": "e2e/windows.sh 的事件：窗口开始到结束；IO 从 <窗口>_io_on 到 <窗口>_io_end",
               "gridPos": {"x": 0, "y": y, "w": 24, "h": 5},
-              "targets": [tgt(f'max by (name) (epio_window{{{E},name!~"prof_.*"}})', "{{name}}", "A"),
-                          tgt(f"max by (name) (epio_io{{{E}}})", "{{name}} 的 IO", "B")],
+              "targets": [tgt(f'max by (name) (last_over_time(epio_window{{{E},name!~"prof_.*"}}[3h])) > 0', "{{name}}", "A"),
+                          tgt(f"max by (name) (last_over_time(epio_io{{{E}}}[3h])) > 0", "{{name}} 的 IO", "B")],
               "fieldConfig": {"defaults": {"custom": {"fillOpacity": 85, "lineWidth": 0},
                                            "mappings": [{"type": "value", "options": {
                                                "1": {"text": "运行", "color": "green", "index": 0},
@@ -109,6 +113,40 @@ def build():
     P.append(ts_panel("EP：每个 rank 的 dispatch 均值（µs，看有没有个别 rank 慢）",
                       [tgt(f'epio_ep_rank_us{{{E},kernel="dispatch"}}', "{{rank}}（{{window}}）")], 12, y,
                       unit="µs", points=True))
+    y += 8
+    P.append(row("KV 突发和每一步对齐：在下面的 profiler 采样里拖选一段（几秒），看 KV 打进来的那几步", y)); y += 1
+    P.append({"type": "state-timeline", "title": "profiler 采样（每个窗口中间约 8 秒；拖选一段放大）", "datasource": DS,
+              "gridPos": {"x": 0, "y": y, "w": 24, "h": 3},
+              "targets": [tgt(f'max by (name) (last_over_time(epio_window{{{E},name=~"prof_.*"}}[3h])) > 0', "{{name}}", "A")],
+              "fieldConfig": {"defaults": {"custom": {"fillOpacity": 85, "lineWidth": 0},
+                                           "mappings": [{"type": "value", "options": {
+                                               "1": {"text": "采样", "color": "purple", "index": 0},
+                                               "0": {"text": " ", "color": "transparent", "index": 1}}}]}},
+              "options": {"mergeValues": True, "showValue": "never", "rowHeight": 0.85, "alignValue": "left",
+                          "legend": {"showLegend": False}}})
+    y += 3
+    P.append(ts_panel("decode 每张卡接收（2 ms 一个点；300–400 Gb/s 的一段就是一次 KV，其余约 30 Gb/s 是 EP）",
+                      [tgt(nic_avg("rx_rdma_ucast_bytes", "$decode") + " * 8", "{{host}} {{netdev}}")], 0, y, w=24, h=7,
+                      unit="bps", interval="2ms"))
+    y += 7
+    P.append(ts_panel("decode 收到的 ECN 标记（每秒，按节点合计）：KV 在交换机里把这台 decode 的入口队列堆过 ECN 门限",
+                      [tgt(f'sum by (host) ({nic_avg("rx_rdma_ecn_pkts", "$decode")})', "{{host}}")], 0, y, w=24, h=6,
+                      interval="2ms",
+                      desc="交换机往这台 decode 方向的出口队列超过 ECN 门限时，给经过的包打标记，KV 和排在它后面的 EP 都会被打；"
+                           "decode 每收到一个带标记的包记一次。KV 放进 TC 0 后这里是 0：KV 和 EP 走不同的队列"))
+    y += 6
+    P.append(ts_panel("每一步：时长（粗线）和这一步里 EP 内核的时间（细线）（profiler 采样期间，每个 DP rank，ms）",
+                      [tgt(f'epio_ep_step_ms{{{E},kind="step"}}', "{{dp}} 每步时长", "A"),
+                       tgt(f'epio_ep_step_ms{{{E},kind="ep"}}', "{{dp}} EP 内核", "B")], 0, y, w=24, h=8,
+                      unit="ms", step_after=True,
+                      overrides=[{"matcher": {"id": "byFrameRefID", "options": "B"},
+                                  "properties": [{"id": "custom.lineWidth", "value": 1},
+                                                 {"id": "custom.fillOpacity", "value": 0}]}],
+                      desc="tools/ep_push.py 解析每个 DP rank 的 TP rank 0 的 trace：一步从它的第一个 EP 内核到下一步的第一个，"
+                           "EP 内核时间是这一步 184 个 dispatch / combine 的耗时之和。每步时长各个 rank 一样；EP 内核时间里含等别的 "
+                           "rank 的时间，所以各 rank 不同：KV 打进 A 时，往 A 发 EP 的那台涨得更多。纵轴到 300 ms 为止，"
+                           "顶格的长步（几百毫秒到两秒）是 decode 本地 prefill 或停顿，不是 KV 造成的"))
+    P[-1]["fieldConfig"]["defaults"]["max"] = 300
     y += 8
     P.append(row("KV / IO（注入的 KV，每次传输一个点）", y)); y += 1
     P.append(ts_panel("KV 每次传输：耗时和延迟的 p50 / p99（30 秒滑动窗口，ms）",
@@ -155,19 +193,25 @@ def build():
                       [tgt(nic_avg("tx_rdma_ucast_bytes", "$source") + " * 8", "{{host}} {{netdev}}")], 12, y, h=9,
                       unit="bps", interval="2ms"))
     y += 9
-    P.append(ts_panel("decode 收到的 CNP 和 ECN 标记（每秒，按节点合计）",
-                      [tgt(f'sum by (host) ({nic_avg("rx_rdma_cnp_pkts", "$decode")})', "{{host}} CNP", "A"),
-                       tgt(f'sum by (host) ({nic_avg("rx_rdma_ecn_pkts", "$decode")})', "{{host}} ECN", "B")],
-                      0, y, interval="2ms",
-                      desc="EP 的包在交换机里排在 KV 后面时被打 ECN 标记，decode 回 CNP"))
+    P.append(ts_panel("收到的 ECN 标记（每秒，按节点合计）：哪台的入口在排队",
+                      [tgt(f'sum by (host) ({nic_avg("rx_rdma_ecn_pkts", "$decode")})', "{{host}}")], 0, y,
+                      interval="2ms",
+                      desc="交换机往这台节点方向的出口队列超过 ECN 门限时，给经过的包打标记，这台节点收到带标记的包就记一次，"
+                           "并给发送方回一个 CNP。KV 打进哪台 decode，哪台的 ECN 就和它的 KV 突发同时涨"))
+    P.append(ts_panel("收到的 CNP（每秒，按节点合计，所有节点）：谁发出的包在对端排了队",
+                      [tgt(f'sum by (host) ({nic_avg("rx_rdma_cnp_pkts", ".*")})', "{{host}}")], 12, y,
+                      interval="2ms",
+                      desc="这台节点发出的包在对端的入口被打了 ECN 标记，对端回的 CNP。KV 打进 A 时，收到 CNP 的是往 A 发包的节点："
+                           "KV 来源，以及往 A 发 EP 的另一台 decode（它的 EP 排在 KV 后面）。smci355 上 QP 默认在没开 DCQCN "
+                           "的 profile 0，收到 CNP 不会降速，它只说明队列堆深了"))
+    y += 8
     P.append(ts_panel("重传包和 ACK 超时（每秒，按节点合计；TC 0 丢包时看这里）",
                       [tgt(f'sum by (host) ({nic_avg("tx_rdma_retx_pkts", ".*")})', "{{host}} 重传包", "A"),
                        tgt(f'sum by (host) ({nic_avg("tx_rdma_ack_timeout", ".*")})', "{{host}} ACK 超时", "B")],
-                      12, y, interval="2ms"))
-    y += 8
+                      0, y, interval="2ms"))
     P.append(ts_panel("PFC pause 帧（ethtool，每秒一个点，按节点合计）",
                       [tgt(f'sum by (host) (max_over_time(netmon_rate{{{E},source="ethtool",counter=~"frames_(tx|rx)_(pri)?pause",resolution="normal"}}[$__interval]))',
-                           "{{host}}")], 0, y))
+                           "{{host}}")], 12, y))
     y += 8
     P.append(row("每个窗口的汇总（跑完后由 tools/epio_summary.py 计算）", y)); y += 1
     P.append({"type": "table", "title": "每个窗口相对 base 的变化、网卡和 KV", "datasource": DS,
@@ -188,11 +232,11 @@ def build():
         {"name": "experiment", "label": "实验", "type": "query", "datasource": DS,
          "query": {"query": "label_values(epio_node, experiment)", "refId": "V"}, "refresh": 2, "sort": 2},
         {"name": "decode", "label": "decode 节点", "type": "query", "datasource": DS, "multi": True, "includeAll": True,
-         "allValue": ".*", "current": {"text": "All", "value": "$__all"},
+         "current": {"text": "All", "value": "$__all"},
          "query": {"query": f'label_values(epio_node{{{E},role="decode"}}, host)', "refId": "V"}, "refresh": 2},
         {"name": "source", "label": "KV 来源", "type": "query", "datasource": DS, "multi": True, "includeAll": True,
-         "allValue": ".*", "current": {"text": "All", "value": "$__all"},
-         "query": {"query": f'label_values(epio_node{{{E},role="kv_source"}}, host)', "refId": "V"}, "refresh": 2},
+         "current": {"text": "All", "value": "$__all"},
+         "query": {"query": f'label_values(epio_node{{{E},role=~"kv_source|prefill"}}, host)', "refId": "V"}, "refresh": 2},
         {"name": "compare", "label": "对比", "type": "query", "datasource": DS, "multi": True, "includeAll": True,
          "allValue": ".*", "current": {"text": "All", "value": "$__all"},
          "query": {"query": "label_values(epio_summary, experiment)", "refId": "V"}, "refresh": 1, "sort": 2},

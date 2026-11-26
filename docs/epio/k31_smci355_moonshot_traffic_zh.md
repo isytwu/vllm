@@ -102,7 +102,7 @@ vLLM 的 K3.1 没有做 sequence-parallel MoE，同样的 batch，EP 的量比 M
 
 ![每个 rank 64 条，Moonshot 形状的 KV（TC 104）：n08-21 每张卡的接收和发送，每一段是相邻两次读数之间的平均速率](img/mk64_MK_traffic.png)
 
-上面两张是 60 秒，下面两张是其中 0.8 秒，每一段阶梯是一个读数间隔（约 12 ms）。接收那一侧，约 30 Gb/s 的 EP 底上叠着 220–300 Gb/s、20–40 ms 的 KV 尖峰，一次落在几张卡上；发送那一侧是 EP，20–33 Gb/s。和 Moonshot 的截图是一个样子。不注入时的同一张图见 `img/mk64_base1_traffic.png`。
+上面两张是 60 秒，下面两张是其中 0.8 秒，每一段阶梯是一个读数间隔（约 12 ms）。接收那一侧，约 30 Gb/s 的 EP 底上叠着 220–300 Gb/s、20–40 ms 的 KV 尖峰，一次落在几张卡上；发送那一侧是 EP，20–33 Gb/s。和 Moonshot 的截图是一个样子。不注入时的同一张图见 `img/mk64_base1_traffic.png`。这种图只能看出 KV 的形状，看不出 EP 有没有被拖慢（EP 的字节不少，只是摊到更长的一步里）；KV 撞上哪一步、那一步慢了多少，见 `k31_smci355_grafana_zh.md` 第 4 节。
 
 **KV 和 EP 同在 TC 104：**
 
